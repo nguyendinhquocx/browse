@@ -2,15 +2,19 @@ export * as UserSettings from "./user-settings"
 import type { JsonObject } from "../agent-relay/protocol"
 import {
   AGENT_GROUPING_KEY,
+  AGENT_GROUP_COLLAPSE_KEY,
   AGENT_WINDOW_KEY,
   HANDOFF_NOTIFICATIONS_KEY,
   HUMAN_INPUT_KEY,
   IDLE_MINUTES_KEY,
+  MUTE_TABS_KEY,
+  agentGroupCollapse,
   agentGrouping,
   agentWindowPlacement,
   handoffNotifications,
   humanInput,
   idleMinutesSetting,
+  muteTabs,
 } from "../shared/protocol"
 
 // The status page's settings for the relay's settings tool (`settings.get`, `settings.set`; cli/src/user-settings.ts).
@@ -20,8 +24,10 @@ import {
 const keys = {
   window: AGENT_WINDOW_KEY,
   grouping: AGENT_GROUPING_KEY,
+  groupCollapse: AGENT_GROUP_COLLAPSE_KEY,
   idleMinutes: IDLE_MINUTES_KEY,
   humanInput: HUMAN_INPUT_KEY,
+  muteTabs: MUTE_TABS_KEY,
   handoffNotifications: HANDOFF_NOTIFICATIONS_KEY,
 } as const
 type Key = keyof typeof keys
@@ -30,8 +36,10 @@ type Key = keyof typeof keys
 const values: Record<Key, readonly (string | number)[]> = {
   window: ["current", "separate"],
   grouping: ["session", "shared", "none"],
+  groupCollapse: ["auto", "off"],
   idleMinutes: [10, 30, 60, 0],
   humanInput: ["on", "off"],
+  muteTabs: ["on", "off"],
   handoffNotifications: ["recording", "always"],
 }
 
@@ -42,8 +50,10 @@ export async function read(): Promise<JsonObject> {
     settings: {
       window: agentWindowPlacement(stored[AGENT_WINDOW_KEY]),
       grouping: agentGrouping(stored[AGENT_GROUPING_KEY]),
+      groupCollapse: agentGroupCollapse(stored[AGENT_GROUP_COLLAPSE_KEY]),
       idleMinutes: idleMinutesSetting(stored[IDLE_MINUTES_KEY]),
       humanInput: humanInput(stored[HUMAN_INPUT_KEY]),
+      muteTabs: muteTabs(stored[MUTE_TABS_KEY]),
       handoffNotifications: handoffNotifications(stored[HANDOFF_NOTIFICATIONS_KEY]),
     },
   }

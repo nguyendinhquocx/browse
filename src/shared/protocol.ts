@@ -216,6 +216,11 @@ export const AGENT_GROUPING_KEY = "agentTabsGrouping"
 export type AgentGrouping = "session" | "shared" | "none"
 export const agentGrouping = (value: unknown): AgentGrouping => (value === "session" || value === "none" ? value : "shared")
 
+/** Whether browse collapses agent groups by itself: "auto" (default), or "off" to leave each group as the user set it. */
+export const AGENT_GROUP_COLLAPSE_KEY = "agentTabsGroupCollapse"
+export type AgentGroupCollapse = "auto" | "off"
+export const agentGroupCollapse = (value: unknown): AgentGroupCollapse => (value === "off" ? "off" : "auto")
+
 /** Minutes an agent tab may sit untouched before it closes; 0 never closes them automatically. */
 export const IDLE_MINUTES_KEY = "tabCleanupIdleMinutes"
 export const DEFAULT_IDLE_MINUTES = 10
@@ -226,6 +231,11 @@ export const idleMinutesSetting = (value: unknown): number =>
 export const HUMAN_INPUT_KEY = "humanInput"
 export type HumanInput = "on" | "off"
 export const humanInput = (value: unknown): HumanInput => (value === "off" ? "off" : "on")
+
+/** Whether tabs agents open are muted: "on", or "off" (default). */
+export const MUTE_TABS_KEY = "muteTabs"
+export type MuteTabs = "on" | "off"
+export const muteTabs = (value: unknown): MuteTabs => (value === "on" ? "on" : "off")
 
 /** When a handoff shows a system notification: only on a recorded tab (default), or on every handoff. */
 export const HANDOFF_NOTIFICATIONS_KEY = "handoffNotifications"

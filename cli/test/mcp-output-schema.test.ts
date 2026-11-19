@@ -503,5 +503,13 @@ describe("advertised tool schemas", () => {
     expect(parseSettingChanges({ idleMinutes: 0 })).toEqual({ idleMinutes: "never" })
     expect(parseSettingChanges({ idleMinutes: "30" })).toEqual({ idleMinutes: 30 })
     expect(() => parseSettingChanges({ idleMinutes: 15 })).toThrow(SettingsInputError)
+    // groupCollapse takes the two values the extension knows, and nothing else.
+    expect(parseSettingChanges({ groupCollapse: "off" })).toEqual({ groupCollapse: "off" })
+    expect(parseSettingChanges({ groupCollapse: "auto" })).toEqual({ groupCollapse: "auto" })
+    expect(() => parseSettingChanges({ groupCollapse: "sometimes" })).toThrow(SettingsInputError)
+    // muteTabs is the same kind of switch.
+    expect(parseSettingChanges({ muteTabs: "on" })).toEqual({ muteTabs: "on" })
+    expect(parseSettingChanges({ muteTabs: "off" })).toEqual({ muteTabs: "off" })
+    expect(() => parseSettingChanges({ muteTabs: "quiet" })).toThrow(SettingsInputError)
   })
 })

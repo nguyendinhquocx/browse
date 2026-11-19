@@ -22,7 +22,6 @@ import {
   type PairingCode,
 } from "../pairing"
 import { TabCleanup } from "../tab-cleanup"
-import { TabIdentity } from "../tab-identity"
 import { codePort, relayTarget } from "./discovery"
 import { discoveredRelay, shownRelayPort } from "./discovered"
 import {
@@ -39,12 +38,16 @@ import {
   PROVEN_PORT_KEY,
   SPENT_KEY,
   TOKENS_KEY,
+  withTimeout,
   type AgentRelayLog,
   type Credential,
   type Handshake,
 } from "./wire"
 
 declare const __OPENCODE_BROWSER_BUILD__: string
+
+/** A tab's ownership lookup must not hold `ready` on a hung storage read. */
+const OWNER_TIMEOUT_MS = 2_000
 
 type PairingFile = { readonly code?: PairingCode; readonly port?: number }
 
@@ -397,18 +400,12 @@ export function createRelayHandshake(deps: {
     deps.log.add("pairing.ok", { source: using.kind })
     // Tabs an agent opened say so: a relay that can't match one to a session after a restart releases it rather
     // than closing it, and a released tab stays tracked so the user's idle-cleanup setting decides when it goes.
-    // The tab's stable id travels with it, so a restored tab keeps the id agents know it by.
     for (const tabId of Array.from(deps.relayTabs)) {
-      // The marker survives a browser restart; within a session the cleanup tracking is the same answer.
-      const agent = (await TabIdentity.isAgent(tabId)) ?? (await TabCleanup.isTracked(tabId))
-      const browseId = await TabIdentity.ensure(tabId, { agent })
+      // The cleanup tracking says who opened the tab: a tab it doesn't track (or couldn't tell us about) is not an
+      // agent's, so the relay releases it rather than closing it.
+      const agent = (await withTimeout(TabCleanup.isTracked(tabId), OWNER_TIMEOUT_MS)) === true
       if (deps.currentSocket() !== current) return
-      current.send(
-        JSON.stringify({
-          method: "debugger.attached",
-          params: { tabId, ...(agent ? { agent: true } : {}), ...(browseId ? { browseId } : {}) },
-        }),
-      )
+      current.send(JSON.stringify({ method: "debugger.attached", params: { tabId, ...(agent ? { agent: true } : {}) } }))
     }
     current.send(JSON.stringify({ method: "ready" }))
     deps.log.add("hello", { tabs: deps.relayTabs.size, protocol: extensionProtocolVersion })

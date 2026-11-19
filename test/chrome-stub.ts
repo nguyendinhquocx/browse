@@ -23,7 +23,7 @@ export class StubEvent {
 
 type Bounds = { left: number; top: number; width: number; height: number }
 type Window = Bounds & { id: number; type: string; state: string; focused: boolean }
-type Tab = { id: number; windowId: number; url: string; pendingUrl?: string; active: boolean; index: number; groupId: number; pinned: boolean; lastAccessed: number }
+type Tab = { id: number; windowId: number; url: string; pendingUrl?: string; active: boolean; index: number; groupId: number; pinned: boolean; muted: boolean; mutedInfo?: { muted: boolean; reason?: string; extensionId?: string }; lastAccessed: number }
 type Group = { id: number; windowId: number; title: string; color: string; collapsed: boolean }
 type CreateWindow = Partial<Bounds> & { url?: string; focused?: boolean; state?: string; type?: string }
 
@@ -83,20 +83,19 @@ function lenient<T extends object>(target: T, namespaces = false): T {
   })
 }
 
+/** The extension's id, as chrome.runtime.id answers: a mute browse set is recorded against it. */
+const RUNTIME_ID = "stubextensionid"
+
 export function createChrome() {
   let nextId = 100
   const windows = new Map<number, Window>()
   const tabs = new Map<number, Tab>()
   const groups = new Map<number, Group>()
-  /** chrome.sessions tab values, by tab id (Chrome keeps them with a restored tab and drops them with a closed one). */
-  const tabValues = new Map<number, Map<string, unknown>>()
   const onChanged = new StubEvent()
   const state = {
     windows,
     tabs,
     groups,
-    /** chrome.sessions tab values, by tab id. */
-    tabValues,
     /** Every chrome.windows.update({ focused: true }) and chrome.tabs.update({ active: true }), in order. */
     activations: [] as ({ windowId: number } | { tabId: number })[],
     /** Tab calls that change groups, in order, so tests can check ungroup comes before remove. */
@@ -114,6 +113,8 @@ export function createChrome() {
     fileAccess: false,
     notificationsFail: false,
     notifications: new Map<string, unknown>(),
+    /** Every chrome.notifications.create call, so tests can see a burst coalesce (the map only keeps the last). */
+    notificationCreates: 0,
   }
   const tabsOf = (windowId: number) => [...tabs.values()].filter((tab) => tab.windowId === windowId).map((tab) => ({ ...tab }))
   const windowsApi = lenient({
@@ -163,18 +164,14 @@ export function createChrome() {
     },
     async remove(id: number) {
       if (!windows.delete(id)) throw new Error(`No window with id: ${id}.`)
-      for (const tab of tabs.values())
-        if (tab.windowId === id) {
-          tabs.delete(tab.id)
-          tabValues.delete(tab.id)
-        }
+      for (const tab of tabs.values()) if (tab.windowId === id) tabs.delete(tab.id)
       windowsApi.onRemoved.emit(id)
       dropEmptyGroups()
     },
   })
   const addTab = (windowId: number, url: string, active: boolean, lastAccessed = Date.now()) => {
     if (active) for (const other of tabs.values()) if (other.windowId === windowId) other.active = false
-    const tab: Tab = { id: nextId++, windowId, url, active, index: [...tabs.values()].filter((tab) => tab.windowId === windowId).length, groupId: -1, pinned: false, lastAccessed }
+    const tab: Tab = { id: nextId++, windowId, url, active, index: [...tabs.values()].filter((tab) => tab.windowId === windowId).length, groupId: -1, pinned: false, muted: false, lastAccessed }
     tabs.set(tab.id, tab)
     return tab
   }
@@ -191,9 +188,9 @@ export function createChrome() {
       },
     }),
     runtime: lenient({
-      id: "stubextensionid",
+      id: RUNTIME_ID,
       lastError: undefined,
-      getURL: (file: string) => `chrome-extension://stubextensionid/${file.replace(/^\//, "")}`,
+      getURL: (file: string) => `chrome-extension://${RUNTIME_ID}/${file.replace(/^\//, "")}`,
       getManifest: () => ({ version: "0.0.0-test" }),
       getPlatformInfo: async () => ({ os: "mac", arch: "arm64", nacl_arch: "arm64" }),
       sendMessage: async () => undefined,
@@ -225,6 +222,9 @@ export function createChrome() {
           for (const other of tabs.values()) if (other.windowId === tab.windowId) other.active = false
         }
         Object.assign(tab, change)
+        // Like Chrome, muting records who did it, so only the extension's own mute can be undone.
+        if (change.muted !== undefined)
+          tab.mutedInfo = change.muted ? { muted: true, reason: "extension", extensionId: RUNTIME_ID } : { muted: false }
         return { ...tab }
       },
       async move(id: number, { windowId, index }: { windowId?: number; index: number }) {
@@ -258,7 +258,6 @@ export function createChrome() {
           if (!tab) throw new Error(`No tab with id: ${tabId}.`)
           state.calls.push(`remove:${tabId}`)
           tabs.delete(tabId)
-          tabValues.delete(tabId)
           ;((chrome.tabs as unknown as { onRemoved: StubEvent }).onRemoved).emit(tabId, { windowId: tab.windowId, isWindowClosing: false })
         }
         dropEmptyGroups()
@@ -304,25 +303,12 @@ export function createChrome() {
       local: storageArea("local", onChanged),
       session: storageArea("session", onChanged),
     }),
-    sessions: lenient({
-      async getTabValue(tabId: number, key: string) {
-        return tabValues.get(tabId)?.get(key)
-      },
-      async setTabValue(tabId: number, key: string, value: unknown) {
-        if (!tabs.has(tabId)) throw new Error(`No tab with id: ${tabId}.`)
-        const values = tabValues.get(tabId) ?? new Map<string, unknown>()
-        values.set(key, structuredClone(value))
-        tabValues.set(tabId, values)
-      },
-      async removeTabValue(tabId: number, key: string) {
-        tabValues.get(tabId)?.delete(key)
-      },
-    }),
     notifications: lenient({
       async getPermissionLevel() {
         return state.permissionLevel
       },
       async create(id: string, options: unknown) {
+        state.notificationCreates++
         if (state.notificationsFail) throw new Error("Notifications are blocked")
         state.notifications.set(id, options)
         return id

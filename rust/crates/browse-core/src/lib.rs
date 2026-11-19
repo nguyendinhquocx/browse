@@ -55,6 +55,9 @@ pub struct TabOptions {
     /// Keep the page focused between calls, for apps that pause while hidden.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_visible: bool,
+    /// Never close the tab as idle: it stays until an agent closes it or the user does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_open: bool,
     /// The connected browser to open the tab in (an id or name `status` lists); the first connected one by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<String>,
@@ -84,21 +87,22 @@ impl TabOptions {
             ),
             Some(_) => anyhow::bail!("allowedOrigins must be an array of strings"),
         };
-        Ok(Self { group: text("group")?, allowed_origins, read_only: flag("readOnly")?, keep_visible: flag("keepVisible")?, browser: text("browser")? })
+        Ok(Self { group: text("group")?, allowed_origins, read_only: flag("readOnly")?, keep_visible: flag("keepVisible")?, keep_open: flag("keepOpen")?, browser: text("browser")? })
     }
 
     /// The option arguments `from_args` reads that the call gave, to refuse them where they don't apply.
     pub fn given(args: &Value) -> Vec<&'static str> {
-        ["group", "allowedOrigins", "readOnly", "keepVisible", "browser"].into_iter().filter(|key| args.get(*key).is_some_and(|v| !v.is_null())).collect()
+        ["group", "allowedOrigins", "readOnly", "keepVisible", "keepOpen", "browser"].into_iter().filter(|key| args.get(*key).is_some_and(|v| !v.is_null())).collect()
     }
 
     /// The JSON schema properties of the options for opening a tab.
     pub fn schema() -> serde_json::Map<String, Value> {
         let Value::Object(map) = serde_json::json!({
             "group": { "type": "string", "description": "When opening a tab: a label for it (and the popups it opens), e.g. the task's name. It is the tab group's title in the browser, and `tabs` can list or close a whole group at once." },
-            "allowedOrigins": { "type": "array", "items": { "type": "string" }, "description": "When opening a tab: hosts or origins it may load (example.com, *.example.com, https://app.example.com, http://localhost:3000). Navigations elsewhere are refused or sent back to about:blank; private and loopback addresses need an exact entry. Popups inherit it." },
-            "readOnly": { "type": "boolean", "description": "When opening a tab: only read it (snapshots, screenshots, page state); input and later navigation are refused." },
+            "allowedOrigins": { "type": "array", "items": { "type": "string" }, "description": "When opening a tab: hosts or origins it may load (example.com, *.example.com, https://app.example.com, http://localhost:3000). Navigations elsewhere are refused or sent back to about:blank; private and loopback addresses need an exact entry. Popups inherit it. It limits top-level navigations, not iframes or the requests a page makes." },
+            "readOnly": { "type": "boolean", "description": "When opening a tab: only read it (snapshots, screenshots, page state); input and later navigation commands are refused, but `eval` and `webmcp` still run page JavaScript that can read, change and navigate the page, so it is not a data boundary." },
             "keepVisible": { "type": "boolean", "description": "When opening a tab: keep it focused to the page between calls, for apps that pause while hidden. Pages can notice." },
+            "keepOpen": { "type": "boolean", "description": "When opening a tab: never close it as idle; it stays open until an agent closes it or the user does. Off by default." },
             "browser": { "type": "string", "description": "When opening a tab: which connected browser, by the id or name `status` lists. Defaults to the first connected one." },
         }) else {
             unreachable!()
@@ -138,6 +142,14 @@ pub struct HandoffResult {
     pub note: Option<String>,
 }
 
+/// Why an action is refused on a tab opened with `readOnly`, shared by the CDP guardrails and the page tools.
+/// `command` is the CDP method or the tool name that was refused.
+pub fn read_only_refusal(command: &str) -> String {
+    format!(
+        "browse blocked {command}: this tab is read-only. Read-only tabs can take snapshots and screenshots, read page information and subscribe to events. Open a tab without readOnly to interact with pages."
+    )
+}
+
 /// What the relay offers tools: the tabs agents opened or the user lent, and the user-facing pieces only the
 /// extension can do. Every tab is addressed by its id; there is no current tab.
 #[async_trait]
@@ -158,6 +170,11 @@ pub trait Browser: Send + Sync {
     async fn human_input(&self, _tab: TabId) -> bool {
         true
     }
+    /// Whether the tab was opened with `readOnly`. The page tools refuse input on such a tab before any CDP work
+    /// (the CDP methods they'd use go through Runtime, which read-only tabs allow for snapshots). An implementation
+    /// that can't see the tab right now (a browser reconnecting, a relay restart) waits for it and then answers;
+    /// false when nothing knows the tab.
+    async fn read_only(&self, tab: TabId) -> bool;
     /// A background activity in the tab started (`busy`) or ended: a network capture ("network") or a recording
     /// ("recording"), keyed per kind. While any key is busy the tab counts as busy, so idle shutdown, idle tab cleanup
     /// and relay restarts wait for it. Called again with `false` when the activity ends for any reason.

@@ -137,7 +137,27 @@ impl Relay {
             None => None,
         };
         let group = options.group.as_deref().and_then(crate::registry::clean_group);
-        Ok(TabOptions { group, allowed_origins, read_only: options.read_only, keep_visible: options.keep_visible, browser: options.browser.clone() })
+        Ok(TabOptions { group, allowed_origins, read_only: options.read_only, keep_visible: options.keep_visible, keep_open: options.keep_open, browser: options.browser.clone() })
+    }
+
+    /// Turns the idle-close exemption on or off for a tab, and tells the extension, which runs its own idle cleanup.
+    /// Returns whether the option changed.
+    pub fn set_keep_open(self: &Arc<Self>, tab: i64, keep_open: bool) -> bool {
+        let changed = {
+            let mut st = self.st();
+            match st.tabs.get_mut(&tab) {
+                Some(entry) if entry.options.keep_open != keep_open => {
+                    entry.options.keep_open = keep_open;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.ext_best_effort(tab, "tabs.keepOpen", json!({ "keepOpen": keep_open }));
+            self.schedule_persist();
+        }
+        changed
     }
 
     /// The browser to open a tab in: the one named (waiting briefly while it reconnects), else the first connected.
@@ -229,13 +249,13 @@ impl Relay {
             .collect()
     }
 
-    /// Tabs idle cleanup may close: no call used them for `ttl`. A caller-chosen id keeps a tab open, and so does a
-    /// call, a handoff, a capture or a recording on it.
+    /// Tabs idle cleanup may close: no call used them for `ttl`. A call, a handoff, a capture or a recording on a tab
+    /// keeps it open, and so does `keepOpen`.
     pub fn idle_tabs(&self, ttl: Duration) -> Vec<(i64, Owner)> {
         let st = self.st();
         st.tabs
             .values()
-            .filter(|t| t.chosen.is_none() && !t.closing && !t.focused && t.last_used.elapsed() >= ttl && st.handoff_for_tab(t.id).is_none() && !st.tab_busy(t.id))
+            .filter(|t| !t.options.keep_open && !t.closing && !t.focused && t.last_used.elapsed() >= ttl && st.handoff_for_tab(t.id).is_none() && !st.tab_busy(t.id))
             .map(|t| (t.id, t.owner))
             .collect()
     }
@@ -326,6 +346,16 @@ impl Relay {
     }
 }
 
+/// The read-only flag the relay knows for a tab, whether it is attached, remembered for a reconnecting browser
+/// (`reconnect_owners`), or held across a relay restart (`restorable`). None when nothing knows the tab.
+fn tab_read_only(st: &crate::relay::State, tab: TabId) -> Option<bool> {
+    st.tabs
+        .get(&tab)
+        .map(|entry| entry.options.read_only)
+        .or_else(|| st.reconnect_owners.values().find(|known| known.tab == tab).map(|known| known.options.read_only))
+        .or_else(|| st.restorable.values().find(|held| held.tab == tab).map(|held| held.options.read_only))
+}
+
 /// The relay as `browse_core::Browser`, handed to every tool.
 #[derive(Clone)]
 pub struct RelayBrowser(pub Arc<Relay>);
@@ -414,6 +444,16 @@ impl Browser for RelayBrowser {
             Some(link) => self.0.human_input_for_link(&link),
             None => crate::settings::human_input_override().unwrap_or(true),
         }
+    }
+
+    async fn read_only(&self, tab: TabId) -> bool {
+        if tab_read_only(&self.0.st(), tab) == Some(true) {
+            return true;
+        }
+        if !self.0.st().tabs.contains_key(&tab) {
+            self.0.await_tab(tab).await;
+        }
+        tab_read_only(&self.0.st(), tab).unwrap_or(false)
     }
 
     /// A numeric tab id, or a caller-chosen id like `work-mail`.

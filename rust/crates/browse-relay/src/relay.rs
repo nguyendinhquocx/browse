@@ -53,9 +53,7 @@ pub struct Tab {
     pub url: String,
     pub title: String,
     pub owner: Owner,
-    /// The extension's stable id for the tab (`chrome.sessions` tab value), which survives a browser restart.
-    pub browse_id: Option<String>,
-    /// The caller-chosen id (`work-mail`), when `tabs new` was given one. Such a tab is never idle-closed.
+    /// The caller-chosen id (`work-mail`), when `tabs new` was given one.
     pub chosen: Option<String>,
     /// How an agent tab was opened (normalized allowlist; `browser` unset: `link_key` says which); default for a lent
     /// tab.
@@ -122,8 +120,6 @@ pub struct KnownOwner {
     pub opener: Option<i64>,
     pub state: Arc<TabState>,
     pub created_at: String,
-    /// The extension's stable id for the tab, if it reported one.
-    pub browse_id: Option<String>,
     /// The caller-chosen id, if the tab has one.
     pub chosen: Option<String>,
 }
@@ -249,32 +245,6 @@ impl State {
         self.from_relay.get(&tab).map(|(key, _)| key.as_str())
     }
 
-    /// The relay id already assigned to a browser's own tab id, if any.
-    pub fn relay_id_for(&self, key: &str, local: i64) -> Option<i64> {
-        self.to_relay.get(&(key.to_string(), local)).copied()
-    }
-
-    /// Registers a relay id chosen by the caller (a tab restored by its stable browse id) for a browser's tab.
-    /// Returns the id in use: `wanted`, or a fresh one if another tab already holds it.
-    pub fn adopt_relay_tab(&mut self, key: &str, local: i64, wanted: i64) -> i64 {
-        if let Some(id) = self.to_relay.get(&(key.to_string(), local)) {
-            return *id;
-        }
-        let id = if self.from_relay.get(&wanted).is_some_and(|(other_key, other_local)| other_key != key || *other_local != local) {
-            let mut id = self.next_tab_id;
-            while self.from_relay.contains_key(&id) {
-                id += 1;
-            }
-            self.next_tab_id = id + 1;
-            id
-        } else {
-            wanted
-        };
-        self.to_relay.insert((key.to_string(), local), id);
-        self.from_relay.insert(id, (key.to_string(), local));
-        id
-    }
-
     /// The attached tab with this caller-chosen id.
     pub fn tab_by_chosen(&self, chosen: &str) -> Option<i64> {
         self.tabs.values().find(|t| !t.closing && t.chosen.as_deref() == Some(chosen)).map(|t| t.id)
@@ -345,6 +315,12 @@ impl State {
     /// A call is running in the tab, or a capture or recording.
     pub fn tab_busy(&self, tab: i64) -> bool {
         self.tabs.get(&tab).is_some_and(|t| !t.busy_keys.is_empty()) || self.tab_call_busy(tab)
+    }
+
+    /// Background work or another call is using the tab. The chosen-id hold a running call takes on its own tab is
+    /// not counted, so a tool can still decide whether that tab is idle.
+    pub fn tab_work_busy(&self, tab: i64) -> bool {
+        self.tabs.get(&tab).is_some_and(|t| !t.busy_keys.is_empty()) || self.calls.values().any(|call| call.tabs.contains(&tab))
     }
 
     pub fn busy(&self) -> bool {
@@ -447,7 +423,6 @@ pub struct Relay {
     pub origins: HashSet<String>,
     pub file_roots: Vec<PathBuf>,
     pub auto_update: Option<AutoUpdateStatus>,
-    pub idle_shutdown: Option<Duration>,
     pub idle_tab_ttl: Option<Duration>,
     pub state: Mutex<State>,
     pub changed: Notify,
@@ -459,8 +434,6 @@ pub struct Relay {
     pub tools: RwLock<Vec<Arc<dyn Tool>>>,
     pub next_call: AtomicU64,
     pub ready: AtomicBool,
-    /// Started on demand by a client (OPENCODE_BROWSER_MANAGED_RELAY=1).
-    pub managed: bool,
     /// Who holds `state`, for the watchdog.
     pub holder: Mutex<Option<Holder>>,
     /// Tool calls in flight by call id, for the log.
@@ -479,8 +452,6 @@ pub struct RelayConfig {
     pub version: String,
     pub build_id: String,
     pub auto_update: Option<AutoUpdateStatus>,
-    pub idle_shutdown: Option<Duration>,
-    pub managed: bool,
 }
 
 fn env_ms(variable: &str, fallback: u64) -> Option<Duration> {
@@ -512,7 +483,6 @@ impl Relay {
             origins: crate::origins::allowed_extension_origins(),
             file_roots,
             auto_update: config.auto_update,
-            idle_shutdown: config.idle_shutdown,
             idle_tab_ttl: env_ms("OPENCODE_BROWSER_IDLE_TAB_TTL_MS", 15 * 60_000),
             state: Mutex::new(State {
                 links: Vec::new(),
@@ -548,7 +518,6 @@ impl Relay {
             tools: RwLock::new(Vec::new()),
             next_call: AtomicU64::new(1),
             ready: AtomicBool::new(false),
-            managed: config.managed,
             holder: Mutex::new(None),
             inflight: Mutex::new(HashMap::new()),
             heartbeat: AtomicU64::new(0),
@@ -700,8 +669,8 @@ impl Relay {
     }
 
     /// Writes the tab registry now: the tabs attached (agent and lent), those of a browser that is reconnecting, and
-    /// those of the previous relay not announced again yet. Their stable ids travel with them, so a tab keeps its id
-    /// when its browser restarts.
+    /// those of the previous relay not announced again yet. They are keyed by target id, so a reconnecting browser's
+    /// tabs keep their ids.
     pub fn persist_now(&self) {
         self.persist(false);
     }
@@ -735,7 +704,6 @@ impl Relay {
                     opener: t.opener,
                     options: t.options.clone(),
                     created_at: t.created_at.clone(),
-                    browse_id: t.browse_id.clone(),
                     chosen: t.chosen.clone(),
                     lent: t.owner == Owner::User,
                 })
@@ -747,7 +715,6 @@ impl Relay {
                 opener: k.opener,
                 options: k.options.clone(),
                 created_at: k.created_at.clone(),
-                browse_id: k.browse_id.clone(),
                 chosen: k.chosen.clone(),
                 lent: k.owner == Owner::User,
             }));

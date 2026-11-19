@@ -12,7 +12,9 @@ import {
 } from "../agent-relay/protocol"
 import {
   HUMAN_INPUT_KEY,
+  MUTE_TABS_KEY,
   humanInput,
+  muteTabs,
   RELAY_ADDRESS_KEY,
   type AgentRelayState,
   type AgentRelayStatus,
@@ -44,9 +46,9 @@ import {
 } from "./agent-relay/wire"
 import { installPopupAdoption } from "./agent-relay/popups"
 import { DebuggerHub } from "./debugger-hub"
+import { DebuggingBarNotice } from "./debugging-bar-notice"
 import { HandoffNotice } from "./handoff-notice"
 import { TabCleanup } from "./tab-cleanup"
-import { TabIdentity } from "./tab-identity"
 import { ToolbarNotice } from "./toolbar-notice"
 
 export type { AgentBadge }
@@ -259,9 +261,10 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
   /**
    * The user dismissed the browser's debugging bar, which detaches the debugger from every tab at once. A tab the user
    * lent goes back to them: untracked by idle cleanup and out of the agent group, but open. A tab an agent opened stays
-   * open, grouped and tracked, so idle cleanup closes it on the usual timer.
+   * open, grouped and tracked, so idle cleanup closes it on the usual timer. The user hears about it once, not per tab.
    */
   const releaseCanceledTab = async (tabId: number) => {
+    void DebuggingBarNotice.canceled()
     // A previous worker may have stored the tracking, so restore it before deciding who opened the tab. If that
     // fails, treat it as agent-opened: leaving it open is safer than letting idle cleanup close a tab the user lent.
     const agentOpened = await TabCleanup.isTracked(tabId).catch(() => true)
@@ -272,8 +275,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
       setTimeout(() => canceledAgentTabs.delete(tabId), canceledAgentTabTtlMs)
     } else {
       TabCleanup.forget(tabId)
-      // The tab is the user's again, not lent: a browser restart must not offer it to an agent.
-      void TabIdentity.clear(tabId)
       await grouping.ungroup(tabId, { released: true }).catch((error: unknown) => {
         log.add("debugger.release.error", { tabId, error: text(error) })
       })
@@ -294,8 +295,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     await TabCleanup.isTracked(tabId).catch(() => undefined)
     TabCleanup.forget(tabId)
     canceledAgentTabs.delete(tabId)
-    // It is the user's now: idle cleanup never closes a lent tab, and a browser restart must not hand it to an agent.
-    void TabIdentity.setAgent(tabId, false)
   }
 
   // The relay-side settings apply as soon as they change; the relay answers with what its environment fixes.
@@ -607,6 +606,8 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
   })
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && HUMAN_INPUT_KEY in changes) void sendSettings()
+    if (area === "local" && MUTE_TABS_KEY in changes)
+      void TabCleanup.setMuted(muteTabs(changes[MUTE_TABS_KEY]?.newValue) === "on").catch(() => undefined)
   })
   // A code entered on the status page, a new relay address or a new name takes effect on a fresh connection.
   chrome.storage.onChanged.addListener(handshake.onPairingStorageChanged)
@@ -617,36 +618,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     countShared: grouping.countShared,
   })
   void chrome.alarms.create(ALARM, { periodInMinutes: extensionReconnectAlarmPeriodMs / 60_000 })
-  /**
-   * Tabs Chrome restored with a browse id on them (a browser restart): attach them again and let the relay claim
-   * them under their old ids. A tab an agent opened is tracked again so idle cleanup still applies, except a tab
-   * with a chosen id, which cleanup leaves alone. Tabs found after the relay connected are announced now; the
-   * others go with the next connection's hello.
-   */
-  const restoreTabs = async (reason: string) => {
-    const found = await TabIdentity.restored().catch(() => [])
-    const fresh: TabIdentity.RestoredTab[] = []
-    for (const entry of found) {
-      if (relayTabs.has(entry.tabId)) continue
-      if (!(await DebuggerHub.attach(entry.tabId).then(() => true, () => false))) continue
-      relayTabs.add(entry.tabId)
-      if (entry.agent) TabCleanup.track(entry.tabId)
-      fresh.push(entry)
-    }
-    if (!fresh.length) return
-    log.add("tabs.restored", { tabs: fresh.length, reason })
-    notify()
-    if (!open() || status !== "connected") return
-    for (const entry of fresh)
-      send({
-        method: "debugger.attached",
-        params: { tabId: entry.tabId, ...(entry.agent ? { agent: true } : {}), browseId: entry.browseId },
-      })
-  }
-  chrome.runtime.onStartup.addListener(() => {
-    // Chrome restores the session's tabs around startup; a look a moment later catches the slower ones.
-    setTimeout(() => void restoreTabs("startup"), 2_000)
-  })
   void DebuggerHub.restore()
     .then(async () => {
       DebuggerHub.attachedTabs().forEach((tabId) => relayTabs.add(tabId))
@@ -658,7 +629,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
       ]
       log.add("worker.start", { restoredTabs: relayTabs.size, ...(orphans.length ? { closedOrphans: orphans.length } : {}) })
     })
-    .then(() => restoreTabs("worker"))
     .then(() => connect("startup"))
 
   return {
