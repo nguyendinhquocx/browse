@@ -51,7 +51,8 @@ launcher (Node 22+) that runs the native binary npm installed for your platform.
 2. **Adds the browse MCP server to your agents.** In a terminal you get a picker: OpenCode and the agents found on this
    computer start checked (your last choice next time). Type to search all supported agents, ↑/↓ to move, Space or Tab
    to toggle, Enter to confirm. An agent running `browse install` sets up itself. Without a terminal OpenCode is the
-   default. Edits keep the comments and formatting of each agent's config.
+   default. Edits keep the comments and formatting of each agent's config, and a config that's a symlink (a
+   dotfiles repo, Nix Home Manager) stays one: browse writes the file it points at.
 3. **Connects the extension.** If no browser has browse yet, install opens it in the Chrome Web Store; add it, and
    install pairs it once it's there. If a browser already has it, install opens its setup page with a one-time pairing
    code in the link, so it pairs without copying anything. Over SSH or without a display it prints a code instead.
@@ -117,7 +118,10 @@ For any other stdio MCP client, run `browse mcp`:
 ```
 
 (`browse install --agent none` prints this with your path.) Re-running install updates the entries it wrote and
-leaves servers named browse that it didn't write alone.
+leaves servers named browse that it didn't write alone. With `OPENCODE_BROWSER_PORT` set, install writes the port into
+each entry's environment so agents start `browse mcp` on the relay the extension is paired with. dsh and Mistral Vibe
+are the exception: add `OPENCODE_BROWSER_PORT` to their env by hand (an entry you write yourself needs it too). Install
+never removes a port it wrote, so if you stop pinning, delete it from those entries or re-run install with the new port.
 
 ### Pairing
 
@@ -328,7 +332,7 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
 | `OPENCODE_BROWSER_CHALLENGE_WAIT_MS=15000` | How long to wait for a bot check the browser clears by itself |
 | `OPENCODE_BROWSER_EXTENSION_TIMEOUT_MS=30000` | How long the relay waits for the extension to answer a command |
 | `OPENCODE_BROWSER_PING_TIMEOUT_MS=10000` | How long a ping may go unanswered before the browser counts as asleep |
-| `OPENCODE_BROWSER_PORT=20000` | Pin the relay's port, with no fallback. The extension finds only browse's own ports (19988, 19990–19997) by itself, so enter `localhost:<port>` as its relay address when you pair |
+| `OPENCODE_BROWSER_PORT=20000` | Pin the relay's port, with no fallback. The extension finds only browse's own ports (19988, 19990–19997) by itself, so enter `localhost:<port>` as its relay address when you pair. Running `browse install` with it set writes it into each agent's MCP entry, so agents start `browse mcp` on it (dsh and Mistral Vibe need it added by hand); install never removes a port it wrote, so stop pinning by deleting it or re-running install with the new port |
 | `OPENCODE_BROWSER_TOOLS=plain\|execute\|all` | Which tools every client gets |
 
 ## Troubleshooting
