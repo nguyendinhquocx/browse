@@ -197,13 +197,14 @@ extension from your browser to finish.
 - **Tabs keep their ids, and an agent can name one.** `tabs` with `action: "new"` and an `id` like `work-mail` opens
   that tab once: asking again returns the same tab without navigating it, and every tool takes `work-mail` as `tab`.
   The id lasts while the tab stays open: a relay restart or extension reload keeps it, and a browser restart loses it
-  (opening that id again is a fresh tab). `tabs` lists each tab's id, url, title, group, last use and whether a call is
-  running in it. A tab opened with `keepOpen: true` stays until an agent or you close it; every other tab closes when
-  idle like the rest.
+  (opening that id again is a fresh tab). `tabs` lists each tab's id, url, title, group, last use, whether a call is
+  running in it, and a waiting handoff's message. A tab opened with `keepOpen: true` stays until an agent or you close
+  it; every other tab closes when idle like the rest.
 - **Agents open their own tabs** in the background of the window you last used, grouped together and collapsed unless
   you're looking at one (you can turn that off). Agents can't switch you to their tabs or bring a window to the front.
   Tabs nobody touches for 10 minutes close by themselves (never while something runs on them). Closing agent tabs never
-  quits the browser: on Windows and Linux, browse leaves a new tab (or window) behind when it would close the last one.
+  quits the browser or leaves it without a window: browse leaves a new tab (or window) behind when it would close the
+  last one.
 - **Relay restarts keep agent tabs.** The relay saves the tabs agents opened and their options, and takes them back
   when it starts again (after an update, say).
 - **Hand an agent one of your tabs** by clicking the toolbar button on it. The badge shows **ON**; click again to take
@@ -216,7 +217,9 @@ extension from your browser to finish.
 - **Uploads.** Large files, or sites that reject copied files, work when the browser is on the same computer and the
   extension has "Allow access to file URLs" turned on in the browser's extensions page (browse → Details): that lets
   the extension read files on this computer, and browse only hands it files from its file roots. Otherwise browse
-  copies the files in, up to 50 MB per call.
+  copies the files in, up to 50 MB per call. Files that aren't on the relay's machine can be passed inline as base64
+  (`{ name, data }`): those always copy in and fit about 10 MB per call (the 50 MB limit is for paths copied in), and
+  mixing them with paths copies the paths in too.
 - **Several browsers at once.** Each connected browser has an id (like `chrome-macbook`); `status` lists them, and new
   tabs open in the default browser unless `browser` names another.
 - **Settings** (the extension's options page, applied right away): where agent tabs open (your window or their own),
@@ -236,7 +239,7 @@ OpenCode, which composes tools in code mode, gets the plain tools. Every other M
 | `navigate` | Open a page: without `tab`, in a new background tab whose id it returns |
 | `snapshot` | A compact outline of the page with refs (`e12`) for the other tools, iframes included; scopes to the page's main area when there's exactly one and says what it left out |
 | `click`, `fill`, `type`, `press`, `select`, `hover`, `drag`, `scroll` | Act on a ref, selector or point, with human-like input |
-| `wait_for`, `dialog`, `upload`, `eval` | Wait for text, a URL or an element; answer dialogs; set files; run JavaScript in the page |
+| `wait_for`, `dialog`, `upload`, `eval` | Wait for text, a URL or an element; answer dialogs; set files on an input or a button that opens the file chooser; run JavaScript in the page |
 | `screenshot`, `screenshot_diff` | The viewport, full page, an element or a rectangle; compare with a baseline |
 | `network`, `console` | Capture a tab's traffic (credentials redacted) or its console messages and errors |
 | `recording` | Record a tab to a video file |
@@ -245,6 +248,8 @@ OpenCode, which composes tools in code mode, gets the plain tools. Every other M
 | `handoff`, `demonstrate` | Ask you to do something only a person can do; ask you to show a flow while it records your steps |
 | `settings`, `status` | Read or change your settings when you ask; the relay, browsers, pairing state and what to do next |
 | `execute` | For other clients: JavaScript with a Playwright-style `page`, `snapshot()`, `ref()`, `handoff()`, `state` and `browse.<tool>()`. Each result starts with the tab it ended in, to pass back as `tab` |
+
+`click` and `fill` on text fields fail when something covers the target, naming what is on top, unless you pass `force: true`.
 
 Everything is a CLI too: `browse navigate https://example.com` prints the new tab's id, then `browse snapshot --tab
 <id>`, `browse click e12 --tab <id>`, `browse execute --file script.js`. `browse tools` lists them and `browse <tool>
@@ -338,8 +343,9 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
 ## Troubleshooting
 
 - `browse status` shows the install, the agents browse is set up in, updates, the relay, the extension and agent tabs,
-  and says what to do when the extension is missing, unpaired, closed or out of date. Agents get the same from the
-  `status` tool.
+  and says what to do when the extension is missing, unpaired, closed or out of date. A tab waiting on you is marked
+  `waiting on you: <message>`, and `browse status --json` or `browse tabs` gives the message and when the handoff
+  started (`handoff.message`, `handoff.startedAt`). Agents get the same from the `status` and `tabs` tools.
 - After the relay restarts, the extension reconnects by itself within about half a minute; calls made in the meantime
   wait for it.
 - An agent says browse's tools are missing: restart the agent (or reload its MCP servers) after `browse install`.

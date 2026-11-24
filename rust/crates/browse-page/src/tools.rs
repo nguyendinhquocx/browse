@@ -3,11 +3,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use browse_core::{CdpError, TabOptions, TabState, Tool, ToolContext, ToolOutput, ToolSpec};
+use browse_core::{
+    Arg as DriverArg, CallOptions, DragOutcome, DriverError, Emulation, Evaluated, FileChooser, FileChooserArm, FrameId,
+    Geolocation, MediaFeature, MediaOverride, Realm, Receiver, Returns, TabDriver, TabOptions, Tool, ToolContext, ToolOutput,
+    ToolSpec, ViewportOverride, World,
+};
 use serde_json::{Map, Value, json};
 
 use crate::actions::{self, PointerOptions};
@@ -15,6 +19,7 @@ use crate::aftermath::{self, AfterOptions};
 use crate::human::Point;
 use crate::input::{Input, Interrupted};
 use crate::eval;
+use crate::files::{MAX_UPLOAD_BYTES, UploadFile};
 use crate::navigation::{self, NavResult, WaitUntil};
 use crate::page::{Arg, DialogPolicy, ElementOr, TabPage, truncate, v};
 use crate::snapshot;
@@ -39,7 +44,7 @@ const INPUT_TOOLS: &[&str] = &["click", "fill", "type", "press", "select", "hove
 #[async_trait]
 impl Tool for PageTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec { name: self.name.into(), description: self.description.into(), input_schema: (self.schema)() }
+        ToolSpec { name: self.name.into(), description: self.description.into(), input_schema: (self.schema)(), output_schema: (self.name == "eval").then(eval_output_schema) }
     }
 
     async fn call(&self, ctx: ToolContext, args: Value) -> Result<ToolOutput> {
@@ -132,8 +137,7 @@ const ACTION_TIMEOUT_MS: u64 = 10_000;
 
 struct Ctx {
     ctx: ToolContext,
-    /// The tab's state, and browse-page's part of it (refs).
-    state: Arc<TabState>,
+    /// browse-page's part of the tab's state (refs).
     tab_state: Arc<PageTab>,
     page: Arc<TabPage>,
 }
@@ -155,10 +159,9 @@ async fn open_input(ctx: &ToolContext, args: &Value, name: &str) -> Result<Ctx> 
 }
 
 async fn open_tab(ctx: &ToolContext, tab: i64) -> Result<Ctx> {
-    let state = ctx.state(tab).await?;
     let tab_state = state::tab(ctx, tab).await?;
     let page = tab_state.page(ctx).await?;
-    Ok(Ctx { ctx: ctx.clone(), state, tab_state, page })
+    Ok(Ctx { ctx: ctx.clone(), tab_state, page })
 }
 
 async fn human_enabled(ctx: &ToolContext, page: &TabPage) -> bool {
@@ -521,7 +524,10 @@ async fn fill_one(c: &Ctx, input: &mut Input<'_>, field: &Field, timeout: Durati
             if field.checked.is_some() {
                 bail!("{} is not a checkbox; pass value instead of checked", label);
             }
-            actions::wait_editable(&c.page, &resolved, timeout, force).await?;
+            let deadline = Instant::now() + timeout;
+            actions::wait_editable(&c.page, &resolved, deadline, force).await?;
+            let resolved = actions::ensure_reachable(&c.page, &c.tab_state, input, &field.spec, deadline, force).await?;
+            let label = target_label(&field.spec, &resolved.label);
             let text = field.value.clone().unwrap_or_default();
             let state = c.page.call_element(&resolved.element, "fill", vec![v(&text)], true).await?;
             match state.as_str() {
@@ -735,10 +741,6 @@ async fn drag(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 }
                 None => from_point.unwrap(),
             };
-            input.move_to(from, 1).await?;
-            c.page.clear_drag();
-            input.set_intercept_drags(true).await;
-            input.down("left", 1).await?;
             let to = match &to_spec {
                 Some(spec) => {
                     let (resolved, at) = actions::locate(&c.page, &c.tab_state, input, spec, PointerOptions { hit_test: false, ..options }).await?;
@@ -747,21 +749,9 @@ async fn drag(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 }
                 None => to_point.unwrap(),
             };
-            // A first small move starts an HTML5 drag, which Chrome hands back as Input.dragIntercepted.
-            let nudge = Point { x: from.x + (to.x - from.x).signum() * 5.0, y: from.y + (to.y - from.y).signum() * 5.0 };
-            input.move_to(nudge, 1).await?;
-            c.page.wait_until(Duration::from_millis(150), Duration::from_millis(25), |page| page.has_drag()).await;
-            input.set_intercept_drags(false).await;
-            if let Some(data) = c.page.take_drag() {
-                input.move_to(to, steps).await?;
-                input.dispatch_drag("dragEnter", to, &data).await?;
-                input.dispatch_drag("dragOver", to, &data).await?;
-                input.dispatch_drag("drop", to, &data).await?;
-                input.up("left", 1).await?;
+            let outcome = input.drag(from, to, steps).await?;
+            if outcome == DragOutcome::Dropped {
                 out.insert("html5".into(), json!(true));
-            } else {
-                input.move_to(to, steps).await?;
-                input.up("left", 1).await?;
             }
             Ok(out)
         })
@@ -955,13 +945,11 @@ async fn eval(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 return Err(error);
             }
         };
-        let session_used = match &target {
-            eval::Target::Element { session, .. } | eval::Target::Context { session, .. } | eval::Target::Object { session, .. } => session.clone(),
-        };
+        let frame_used = target.frame_id().to_string();
         let result = tokio::time::timeout(timeout, eval::run(&page, &target, compile, &expression, arg.as_ref(), callable)).await;
         match result {
             Err(_) => {
-                let stopped = eval::stop(&page, session_used.as_deref()).await;
+                let stopped = eval::stop(&page, &frame_used).await;
                 c.page.release().await;
                 match stopped {
                     eval::Stop::Stopped => bail!("eval timed out after {} ms; the script was still running, so browse stopped it", timeout.as_millis()),
@@ -969,7 +957,7 @@ async fn eval(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                     eval::Stop::Stuck => bail!("eval timed out after {} ms and browse could not stop the script: the tab is not responding. Close or reload the tab", timeout.as_millis()),
                 }
             }
-            Ok(Err(error)) if eval::is_lost(&error) || error.to_string().contains("Inspected target navigated") => {
+            Ok(Err(error)) if eval::is_lost(&error) => {
                 // The navigation's events can trail the error: give them a moment.
                 page.wait_until(Duration::from_millis(1_000), Duration::from_millis(50), |page| generation(page) != started_generation || page.pending_navigation().is_some()).await;
                 let navigated = generation(&page) != started_generation || page.pending_navigation().is_some();
@@ -994,15 +982,16 @@ async fn eval(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
         }
     };
     if let Some(hint) = hint {
-        return Ok(json_output(json!({ "result": null, "hint": hint })));
+        return Ok(ToolOutput { structured_content: Some(json!({ "value": null, "hint": hint })), ..json_output(json!({ "result": null, "hint": hint })) });
     }
     let text = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
     let chars = text.chars().count();
     if chars > MAX_EVAL_CHARS {
         let cut: String = text.chars().take(MAX_EVAL_CHARS).collect();
-        return Ok(ToolOutput::text(format!("{cut}\n… [truncated: the result is {chars} characters; return less, or pick the fields you need]", )));
+        let note = format!("the result is {chars} characters; return less, or pick the fields you need");
+        return Ok(ToolOutput { structured_content: Some(json!({ "value": null, "truncated": note })), ..ToolOutput::text(format!("{cut}\n… [truncated: {note}]")) });
     }
-    Ok(ToolOutput::text(text))
+    Ok(ToolOutput { structured_content: Some(json!({ "value": value })), ..ToolOutput::text(text) })
 }
 
 // wait_for
@@ -1076,25 +1065,30 @@ async fn dialog(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
 
 async fn upload(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let c = open_input(&ctx, &args, "upload").await?;
-    let spec = Spec::from_args(&args).ok_or_else(|| anyhow!("upload needs a ref or selector for the file input (or its label)"))?;
-    let files: Vec<String> = match args.get("files") {
-        Some(Value::String(file)) => vec![file.clone()],
-        Some(Value::Array(files)) => files.iter().filter_map(|f| f.as_str().map(str::to_string)).collect(),
-        _ => bail!("upload needs files: absolute paths inside the file roots"),
-    };
-    let checked: Vec<String> = files.iter().map(|f| crate::files::check_upload(f, &c.ctx.file_roots).map(|p| p.display().to_string())).collect::<Result<_>>()?;
+    let spec = Spec::from_args(&args).ok_or_else(|| anyhow!("upload needs a ref or selector for the file input, or for the button that opens its file chooser"))?;
+    let files = crate::files::parse_upload_files(args.get("files"))?;
+    let files: Vec<UploadFile> = files.iter().map(|file| file.checked(&c.ctx.file_roots)).collect::<Result<_>>()?;
     let timeout = timeout_arg(&args, ACTION_TIMEOUT_MS);
-    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, _input| {
+    let explicit_timeout = args.get("timeout").and_then(Value::as_u64).is_some();
+    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input| {
         Box::pin(async move {
             let resolved = target::resolve(&c.page, &c.tab_state, &spec, ResolveOptions { timeout, act: true }).await?;
-            let input = match c.page.call_element_result(&resolved.element.frame, "fileInput", vec![Arg::Element(resolved.element.clone())], true).await? {
-                ElementOr::Element(element) => element,
-                ElementOr::Status(_) => bail!("{} is not a file input (input[type=file]) or its label", target_label(&spec, &resolved.label)),
+            let name = if resolved.label.is_empty() { spec.label() } else { resolved.label.clone() };
+            let (target, interception) = match c.page.call_element_result(&resolved.element.frame, "fileInput", vec![Arg::Element(resolved.element.clone())], true).await? {
+                ElementOr::Element(element) => (element, None),
+                ElementOr::Status(_) => {
+                    let (target, interception) = upload_through_file_chooser(c, input, &spec, &name, timeout, explicit_timeout).await?;
+                    (target, Some(interception))
+                }
             };
-            let via = set_files(c, &c.page, &input, &checked, c.ctx.browser.connected_locally(c.page.tab()).await).await?;
+            let sent = set_files(c, &c.page, &target, &files, c.ctx.browser.connected_locally(c.page.tab()).await).await;
+            if let Some(interception) = interception {
+                interception.disarm().await;
+            }
+            let via = sent?;
             let mut out = Map::new();
             out.insert("target".into(), target_label(&spec, &resolved.label));
-            out.insert("files".into(), json!(checked.iter().map(|p| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect::<Vec<_>>()));
+            out.insert("files".into(), json!(files.iter().map(UploadFile::name).collect::<Vec<_>>()));
             out.insert("via".into(), json!(via));
             Ok(out)
         })
@@ -1102,8 +1096,103 @@ async fn upload(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     .await
 }
 
-/// The most bytes one upload sends into the page when it copies files in (the paths route has no limit).
-const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+/// Keeps native file chooser interception off after the upload, however it ends, and holds the tab's chooser
+/// lock until the disable has gone out.
+struct ChooserInterception {
+    driver: Arc<dyn TabDriver>,
+    arm: FileChooserArm,
+    lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ChooserInterception {
+    async fn arm(page: &Arc<TabPage>, timeout: Duration) -> Result<Self> {
+        let lock = tokio::time::timeout(timeout, page.file_chooser.clone().lock_owned())
+            .await
+            .map_err(|_| anyhow!("upload timed out waiting for the tab's file chooser"))?;
+        let driver = page.driver().clone();
+        let arm = driver.prepare_file_chooser_interception();
+        // The guard exists before enabling, so a dropped enable still disarms this generation.
+        let guard = Self { driver: driver.clone(), arm, lock: Some(lock) };
+        driver.arm_file_chooser_interception(arm).await.map_err(crate::page::driver_error)?;
+        Ok(guard)
+    }
+
+    async fn disarm(mut self) {
+        self.driver.disarm_file_chooser_interception(self.arm).await;
+        // Released only after the disable finishes.
+        self.lock = None;
+    }
+}
+
+impl Drop for ChooserInterception {
+    fn drop(&mut self) {
+        let Some(lock) = self.lock.take() else { return };
+        let driver = self.driver.clone();
+        let arm = self.arm;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                driver.disarm_file_chooser_interception(arm).await;
+                drop(lock);
+            });
+        }
+    }
+}
+
+/// Clicks a target that opens a native file chooser and returns the input Chrome says it would fill, with
+/// interception still on so the files can be set before it is turned off.
+async fn upload_through_file_chooser(
+    c: &Ctx,
+    input: &mut Input<'_>,
+    spec: &Spec,
+    name: &str,
+    timeout: Duration,
+    explicit_timeout: bool,
+) -> Result<(crate::page::Element, ChooserInterception)> {
+    let (resolved, at) = actions::locate(
+        &c.page,
+        &c.tab_state,
+        input,
+        spec,
+        PointerOptions { timeout, force: false, position: None, hit_test: true, enabled: true },
+    )
+    .await?;
+    // Move first, so only the press that follows arming can open the chooser.
+    input.move_to(at, 1).await?;
+    let interception = ChooserInterception::arm(&c.page, timeout).await?;
+    let started = Instant::now();
+    let clicked = async {
+        input.click_after_move("left", 1).await?;
+        let remaining = timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(1));
+        let wait = if explicit_timeout { remaining } else { remaining.min(Duration::from_secs(2)) };
+        match c.page.driver().take_file_chooser(wait).await.map_err(crate::page::driver_error)? {
+            Some(FileChooser { frame, input: Some(handle) }) => {
+                if frame.as_str() != resolved.element.frame {
+                    bail!("the file chooser opened in a different frame than {name}");
+                }
+                if handle.document.0 != resolved.element.generation {
+                    bail!("the frame navigated before the file chooser opened");
+                }
+                c.page.track_transient(handle.clone());
+                Ok(crate::page::Element {
+                    frame: handle.frame.as_str().to_string(),
+                    generation: handle.document.0,
+                    handle,
+                })
+            }
+            Some(_) => bail!("the file chooser opened from {name}, but browse could not find the file input it would fill"),
+            None => bail!("clicked {name}: it isn't a file input or its label, and it opened no file chooser"),
+        }
+    }
+    .await;
+    match clicked {
+        Ok(target) => Ok((target, interception)),
+        Err(error) => {
+            interception.disarm().await;
+            Err(error)
+        }
+    }
+}
+
 /// Raw bytes per chunk sent to the page (base64 makes each call about a third larger).
 const UPLOAD_CHUNK: usize = 768 * 1024;
 
@@ -1151,14 +1240,25 @@ fn mime_type(path: &std::path::Path) -> &'static str {
 /// Puts files into a file input: when the browser reads this filesystem Chrome takes them from disk, else browse reads
 /// them and sends the bytes, so it works when the browser is on another machine and without the extension's file URL
 /// access.
-async fn set_files(c: &Ctx, page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String], connected_locally: bool) -> Result<&'static str> {
+async fn set_files(c: &Ctx, page: &Arc<TabPage>, input: &crate::page::Element, files: &[UploadFile], connected_locally: bool) -> Result<&'static str> {
     // The target may have taken a while to resolve since the first check: check every path again, for both routes.
-    let checked: Vec<String> = paths.iter().map(|path| crate::files::check_upload(path, &c.ctx.file_roots).map(|p| p.display().to_string())).collect::<Result<_>>()?;
+    let checked: Vec<UploadFile> = files.iter().map(|file| file.checked(&c.ctx.file_roots)).collect::<Result<_>>()?;
     upload_status(page.call_element(input, "uploadCheck", vec![v(checked.len())], false).await?.as_str())?;
+    // Inline bytes only exist here, so a mix with paths still has to copy everything in.
+    let paths: Option<Vec<String>> = checked
+        .iter()
+        .map(|file| match file {
+            UploadFile::Path(path) => Some(path.clone()),
+            UploadFile::Inline(_) => None,
+        })
+        .collect();
     if connected_locally
-        && checked.iter().all(|path| crate::files::private_for_paths(path))
-        && probe_paths(c, page, input, &checked).await? {
-        page.send("DOM.setFileInputFiles", json!({ "objectId": input.object_id, "files": checked }), input.session.as_deref()).await?;
+        && let Some(paths) = paths
+        && paths.iter().all(|path| crate::files::private_for_paths(path))
+        && probe_paths(page, input, &paths).await?
+    {
+        let bufs: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        page.guard_dialog(page.driver().set_files(&input.handle, &bufs)).await?;
         return Ok("paths");
     }
     set_files_by_copy(page, input, &checked).await?;
@@ -1168,21 +1268,19 @@ async fn set_files(c: &Ctx, page: &Arc<TabPage>, input: &crate::page::Element, p
 /// Proves the browser reads this filesystem before the real input is touched: a detached input gets a sentinel file
 /// browse just wrote, then the real paths, and the page must open and match every file's size and mtime. False means
 /// copy instead (the browser refused, can't read a file, or sees another filesystem); connection failures are errors.
-async fn probe_paths(c: &Ctx, page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String]) -> Result<bool> {
+async fn probe_paths(page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String]) -> Result<bool> {
     let Some(sentinel) = Sentinel::create() else { return Ok(false) };
-    let cdp = c.ctx.browser.cdp(page.tab()).await?;
     let probe = match page.call_element_result(&input.frame, "uploadProbeInput", vec![], false).await? {
         ElementOr::Element(element) => element,
         ElementOr::Status(_) => bail!("upload: the page did not give browse a file input to check"),
     };
-    let result = probe_files(page, &cdp, &probe, &sentinel, paths).await;
-    let _ = cdp.send("Runtime.releaseObject", json!({ "objectId": probe.object_id }), probe.session.as_deref()).await;
+    let result = probe_files(page, &probe, &sentinel, paths).await;
+    page.release_object(&probe).await;
     result
 }
 
-/// The probe itself, split out so [probe_paths] releases the detached input's object however it ends.
-async fn probe_files(page: &Arc<TabPage>, cdp: &Arc<dyn browse_core::Cdp>, probe: &crate::page::Element, sentinel: &Sentinel, paths: &[String]) -> Result<bool> {
-    if !set_probe_files(page, cdp, probe, &[sentinel.path.display().to_string()]).await? {
+async fn probe_files(page: &Arc<TabPage>, probe: &crate::page::Element, sentinel: &Sentinel, paths: &[String]) -> Result<bool> {
+    if !set_probe_files(page, probe, std::slice::from_ref(&sentinel.path)).await? {
         return Ok(false);
     }
     let read = page.call_element(probe, "uploadFiles", vec![], false).await?;
@@ -1190,7 +1288,8 @@ async fn probe_files(page: &Arc<TabPage>, cdp: &Arc<dyn browse_core::Cdp>, probe
     if !one || page.call_element(probe, "uploadText", vec![], false).await?.as_str() != Some(sentinel.nonce.as_str()) {
         return Ok(false);
     }
-    if !set_probe_files(page, cdp, probe, paths).await? {
+    let bufs: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    if !set_probe_files(page, probe, &bufs).await? {
         return Ok(false);
     }
     let read = page.call_element(probe, "uploadFiles", vec![], false).await?;
@@ -1208,20 +1307,17 @@ async fn probe_files(page: &Arc<TabPage>, cdp: &Arc<dyn browse_core::Cdp>, probe
     Ok(true)
 }
 
-/// Sets files on the probe input, false on a protocol refusal (an extension without file URL access answers one).
-/// TabPage::send does this, but turns every CdpError into one anyhow message; the probe must tell a refusal from a
-/// disconnect, so this repeats its dialog check and race around the raw command.
-async fn set_probe_files(page: &Arc<TabPage>, cdp: &Arc<dyn browse_core::Cdp>, probe: &crate::page::Element, paths: &[String]) -> Result<bool> {
+async fn set_probe_files(page: &Arc<TabPage>, probe: &crate::page::Element, paths: &[std::path::PathBuf]) -> Result<bool> {
     page.ensure_no_dialog()?;
     let sent = tokio::select! {
-        result = cdp.send("DOM.setFileInputFiles", json!({ "objectId": probe.object_id, "files": paths }), probe.session.as_deref()) => result,
+        result = page.driver().set_files(&probe.handle, paths) => result,
         _ = page.dialog_opened() => {
             return Err(page.ensure_no_dialog().err().unwrap_or_else(|| anyhow!("The page opened a dialog while browse checked the file paths; answer it with the dialog tool and try again")));
         }
     };
     match sent {
         Ok(_) => Ok(true),
-        Err(CdpError::Protocol(_)) => Ok(false),
+        Err(DriverError::Protocol(_) | DriverError::Refused(_) | DriverError::Unsupported(_)) => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -1301,35 +1397,50 @@ fn random_hex(bytes: usize) -> Option<String> {
 }
 
 /// Puts files into a file input as in-memory File objects: browse reads them where it runs and sends the bytes.
-async fn set_files_by_copy(page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String]) -> Result<()> {
-    use base64::Engine;
+async fn set_files_by_copy(page: &Arc<TabPage>, input: &crate::page::Element, files: &[UploadFile]) -> Result<()> {
     let mut total = 0u64;
-    for path in paths {
-        total += std::fs::metadata(path).map(|m| m.len()).map_err(|e| anyhow!("upload: {path}: {e}"))?;
+    for file in files {
+        total += match file {
+            UploadFile::Path(path) => std::fs::metadata(path).map(|m| m.len()).map_err(|e| anyhow!("upload: {path}: {e}"))?,
+            UploadFile::Inline(file) => file.bytes.len() as u64,
+        };
     }
     if total > MAX_UPLOAD_BYTES {
         bail!("upload: the files are {:.1} MB together; browse uploads at most {} MB per call", total as f64 / 1_048_576.0, MAX_UPLOAD_BYTES / 1_048_576);
     }
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let mut files = Vec::new();
-    let ids: Vec<String> = (0..paths.len()).map(|i| format!("{stamp:x}-{i}")).collect();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok();
+    let stamp = now.map(|d| d.as_nanos()).unwrap_or(0);
+    let now_ms = now.map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut sent_files = Vec::new();
+    let ids: Vec<String> = (0..files.len()).map(|i| format!("{stamp:x}-{i}")).collect();
     let sent = async {
-        for (path, id) in paths.iter().zip(&ids) {
-            let bytes = tokio::fs::read(path).await.map_err(|e| anyhow!("upload: {path}: {e}"))?;
-            for chunk in bytes.chunks(UPLOAD_CHUNK) {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
-                page.call_value(&input.frame, "uploadChunk", vec![v(id), v(encoded)], false).await?;
+        for (file, id) in files.iter().zip(&ids) {
+            let (name, mime, last_modified) = match file {
+                UploadFile::Path(path) => {
+                    let path = std::path::Path::new(path);
+                    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0);
+                    (path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), mime_type(path).to_string(), modified)
+                }
+                UploadFile::Inline(file) => {
+                    let mime = file.mime_type.clone().filter(|mime| !mime.is_empty()).unwrap_or_else(|| mime_type(std::path::Path::new(&file.name)).to_string());
+                    (file.name.clone(), mime, file.last_modified.unwrap_or(now_ms))
+                }
+            };
+            match file {
+                UploadFile::Path(path) => {
+                    let bytes = tokio::fs::read(path).await.map_err(|e| anyhow!("upload: {path}: {e}"))?;
+                    send_upload_chunks(page, &input.frame, id, &bytes).await?;
+                }
+                UploadFile::Inline(file) => send_upload_chunks(page, &input.frame, id, &file.bytes).await?,
             }
-            let path = std::path::Path::new(path);
-            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0);
-            files.push(json!({
+            sent_files.push(json!({
                 "id": id,
-                "name": path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                "mime": mime_type(path),
-                "lastModified": modified,
+                "name": name,
+                "mime": mime,
+                "lastModified": last_modified,
             }));
         }
-        page.call_element(input, "uploadFinish", vec![v(&files)], false).await
+        page.call_element(input, "uploadFinish", vec![v(&sent_files)], false).await
     }
     .await;
     match sent {
@@ -1339,6 +1450,16 @@ async fn set_files_by_copy(page: &Arc<TabPage>, input: &crate::page::Element, pa
             Err(error)
         }
     }
+}
+
+/// Sends one file's bytes to the page as base64 chunks; uploadFinish assembles them into a File.
+async fn send_upload_chunks(page: &Arc<TabPage>, frame: &str, id: &str, bytes: &[u8]) -> Result<()> {
+    use base64::Engine;
+    for chunk in bytes.chunks(UPLOAD_CHUNK) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+        page.call_value(frame, "uploadChunk", vec![v(id), v(encoded)], false).await?;
+    }
+    Ok(())
 }
 
 // emulate
@@ -1433,14 +1554,7 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     };
     match args.get("viewport") {
         Some(Value::String(_)) => {
-            let result = async {
-                page.send("Emulation.clearDeviceMetricsOverride", json!({}), None).await?;
-                // Chrome can drop a single clear that lands while the previous size is still settling.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                page.send("Emulation.clearDeviceMetricsOverride", json!({}), None).await?;
-                Ok(json!("reset"))
-            }
-            .await;
+            let result = page.guard_dialog(page.driver().emulate(Emulation::Viewport(None))).await.map(|_| json!("reset"));
             record("viewport", result);
         }
         Some(Value::Object(viewport)) => {
@@ -1449,14 +1563,16 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             let scale = viewport.get("deviceScaleFactor").and_then(Value::as_f64).unwrap_or(0.0);
             let mobile = viewport.get("mobile").and_then(Value::as_bool).unwrap_or(false);
             let settings = json!({ "width": width, "height": height, "deviceScaleFactor": scale, "mobile": mobile });
-            let result = page.send("Emulation.setDeviceMetricsOverride", settings.clone(), None).await.map(|_| settings);
+            let result = page
+                .guard_dialog(page.driver().emulate(Emulation::Viewport(Some(ViewportOverride { width, height, device_scale_factor: scale, mobile }))))
+                .await
+                .map(|_| settings);
             record("viewport", result);
         }
         _ => {}
     }
     let media_keys = [("colorScheme", "prefers-color-scheme"), ("reducedMotion", "prefers-reduced-motion"), ("forcedColors", "forced-colors"), ("contrast", "prefers-contrast")];
     if media_keys.iter().any(|(key, _)| args.get(*key).is_some()) || args.get("media").is_some() {
-        // Chrome replaces every emulated media feature on each call: merge with what this tab already has.
         let mut state = page.media_emulation();
         let mut changed = Vec::new();
         for (key, feature) in media_keys {
@@ -1473,8 +1589,15 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             state.media = if media == "reset" { String::new() } else { media.into() };
             changed.push(("media", media));
         }
-        let features: Vec<Value> = state.features.iter().map(|(name, value)| json!({ "name": name, "value": value })).collect();
-        match page.send("Emulation.setEmulatedMedia", json!({ "media": state.media, "features": features }), None).await {
+        let features: Vec<MediaFeature> = state
+            .features
+            .iter()
+            .map(|(name, value)| MediaFeature { name: name.clone(), value: value.clone() })
+            .collect();
+        match page
+            .guard_dialog(page.driver().emulate(Emulation::Media(MediaOverride { media: state.media.clone(), features })))
+            .await
+        {
             Ok(_) => {
                 page.set_media_emulation(state);
                 for (key, value) in changed {
@@ -1489,13 +1612,13 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
         }
     }
     if let Some(agent) = str_arg(&args, "userAgent") {
-        let value = if agent == "reset" { "" } else { agent };
-        let result = page.send("Emulation.setUserAgentOverride", json!({ "userAgent": value }), None).await.map(|_| json!(agent));
+        let value = (agent != "reset").then(|| agent.to_string());
+        let result = page.guard_dialog(page.driver().emulate(Emulation::UserAgent(value))).await.map(|_| json!(agent));
         record("userAgent", result);
     }
     match args.get("geolocation") {
         Some(Value::String(_)) => {
-            let result = page.send("Emulation.clearGeolocationOverride", json!({}), None).await.map(|_| json!("reset"));
+            let result = page.guard_dialog(page.driver().emulate(Emulation::Geolocation(None))).await.map(|_| json!("reset"));
             record("geolocation", result);
         }
         Some(Value::Object(geo)) => {
@@ -1503,7 +1626,7 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             let longitude = geo["longitude"].as_f64().unwrap_or(0.0);
             let accuracy = geo.get("accuracy").and_then(Value::as_f64).unwrap_or(50.0);
             let result = page
-                .send("Emulation.setGeolocationOverride", json!({ "latitude": latitude, "longitude": longitude, "accuracy": accuracy }), None)
+                .guard_dialog(page.driver().emulate(Emulation::Geolocation(Some(Geolocation { latitude, longitude, accuracy }))))
                 .await
                 .map(|_| json!({ "latitude": latitude, "longitude": longitude, "accuracy": accuracy, "note": "the site still needs the user's location permission" }));
             record("geolocation", result);
@@ -1511,31 +1634,14 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
         _ => {}
     }
     if let Some(touch) = args.get("touch").and_then(Value::as_bool) {
-        let result = page.send("Emulation.setTouchEmulationEnabled", json!({ "enabled": touch, "maxTouchPoints": if touch { 5 } else { 1 } }), None).await.map(|_| json!(touch));
+        let result = page
+            .guard_dialog(page.driver().emulate(Emulation::Touch(touch.then_some(5))))
+            .await
+            .map(|_| json!(touch));
         record("touch", result);
     }
     if let Some(offline) = args.get("offline").and_then(Value::as_bool) {
-        let conditions = json!({ "offline": offline, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1 });
-        let result = if offline {
-            // Chrome applies network emulation only while the Network domain is enabled; enabling it again is
-            // harmless, and the conditions are sent after it so they hold even if a disable reset them.
-            let result = async {
-                page.send("Network.enable", json!({}), None).await?;
-                page.send("Network.emulateNetworkConditions", conditions, None).await
-            }
-            .await;
-            if result.is_ok() {
-                state::set_offline(&c.state, true).await;
-            }
-            result
-        } else {
-            let _ = page.send("Network.emulateNetworkConditions", conditions, None).await;
-            state::set_offline(&c.state, false).await;
-            if !state::network_capture_active(&c.state).await {
-                let _ = page.send("Network.disable", json!({}), None).await;
-            }
-            Ok(Value::Null)
-        };
+        let result = page.guard_dialog(page.driver().emulate(Emulation::Offline(offline))).await;
         record("offline", result.map(|_| json!(offline)));
     }
     if applied.is_empty() && failed.is_empty() {
@@ -1653,20 +1759,21 @@ async fn webmcp(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
 async fn webmcp_main_world(page: &Arc<TabPage>, frame: &str, method: &str, args: Vec<Value>) -> Result<Value> {
     let source = page.call_value(frame, "methodSource", vec![v(method)], false).await?;
     let source = source.as_str().ok_or_else(|| anyhow!("browse could not read its WebMCP helper"))?;
-    let document = page.document(frame).await?;
-    let object = page.main_world_object(&document).await?;
     let declaration = format!("function (spec) {{ return ({{ {source} }}).{method}(...JSON.parse(spec)) }}");
-    let result = page
-        .send(
-            "Runtime.callFunctionOn",
-            json!({ "functionDeclaration": declaration, "objectId": object, "arguments": [{ "value": Value::Array(args).to_string() }], "returnByValue": true, "awaitPromise": true, "objectGroup": crate::page::TRANSIENT_GROUP }),
-            document.session.as_deref(),
+    let realm = Realm { frame: FrameId::from(frame), world: World::Main };
+    let outcome = page
+        .call_driver(
+            &Receiver::Global(realm),
+            &declaration,
+            &[DriverArg::Json(Value::String(Value::Array(args).to_string()))],
+            CallOptions { returns: Returns::Json, await_promise: true, user_activation: false },
         )
         .await?;
-    if let Some(details) = result.get("exceptionDetails") {
-        bail!("{}", crate::page::exception_message(details));
+    match outcome {
+        Err(details) => bail!("{}", details.message),
+        Ok(Evaluated::Json(value)) => Ok(value),
+        Ok(_) => Ok(Value::Null),
     }
-    Ok(result["result"].get("value").cloned().unwrap_or(Value::Null))
 }
 
 // Schemas and descriptions.
@@ -1753,7 +1860,7 @@ fn click_schema() -> Value {
     object(p, &[])
 }
 
-const FILL: &str = "Fill form fields with trusted input, replacing what is there: text inputs, textareas and contenteditable get the value typed in; selects pick the option by value or label; checkboxes/radios/switches take checked. Fill one field with ref/selector + value|checked, or many with fields: [...]. submit presses Enter after the last field. Returns JSON: filled (per field) and what changed.";
+const FILL: &str = "Fill form fields with trusted input, replacing what is there: text inputs, textareas and contenteditable get the value typed in; selects pick the option by value or label; checkboxes/radios/switches take checked. A text field under something else fails fast, naming what is on top (dismiss it, or pass force). Fill one field with ref/selector + value|checked, or many with fields: [...]. submit presses Enter after the last field. Returns JSON: filled (per field) and what changed.";
 
 fn fill_schema() -> Value {
     let field = json!({
@@ -1771,7 +1878,7 @@ fn fill_schema() -> Value {
         "checked": { "type": "boolean", "description": "For a checkbox, radio or switch." },
         "fields": { "type": "array", "items": field, "description": "Several fields in order, instead of ref/selector + value." },
         "submit": { "type": "boolean", "description": "Press Enter after filling." },
-        "force": { "type": "boolean" },
+        "force": { "type": "boolean", "description": "Skip the visible/enabled/editable wait and, for text fields, the covered check; checkboxes get the same checks as click." },
         "timeout": { "type": "integer" },
     })));
     p.insert("ref".into(), json!({ "type": "string", "description": TARGET_DOC }));
@@ -1864,7 +1971,21 @@ fn scroll_schema() -> Value {
     )
 }
 
-const EVAL: &str = "Run JavaScript in the page and return its result as JSON. An expression's value is returned (promises are awaited, await works). Statements (const/let, loops, several lines) return the value of their last expression statement, like a console (`const a = 3; a` gives 3), or what they `return`. Declarations stay local to the call and never leak into the page. DOM nodes come back as \"<tag#id.class>\", Map as an object, Set as an array, Date as an ISO string, Errors as {name, message}, cycles as \"[Circular]\". A script still running at the timeout is stopped. By default it runs in browse's isolated world: it sees the DOM but not the page's own JS globals, and the page can't see it. world \"main\" runs in the page's own world (window variables, frameworks) and is visible to it. With ref/selector or arg, expression must be a function, called as (element, arg) => ...; e.g. expression \"(el) => el.href\" with ref \"e5\". Without them, a function written as the whole expression is called with no arguments, so \"() => document.title\" works like \"document.title\". frame (a selector of an <iframe>) runs in that frame. Results over 100k characters are cut. Results are returned as-is, without secret redaction.";
+const EVAL: &str = "Run JavaScript in the page and return its result as { value } (JSON). An expression's value is returned (promises are awaited, await works). Statements (const/let, loops, several lines) return the value of their last expression statement, like a console (`const a = 3; a` gives 3), or what they `return`. Declarations stay local to the call and never leak into the page. DOM nodes come back as \"<tag#id.class>\", Map as an object, Set as an array, Date as an ISO string, Errors as {name, message}, cycles as \"[Circular]\". A script still running at the timeout is stopped. By default it runs in browse's isolated world: it sees the DOM but not the page's own JS globals, and the page can't see it. world \"main\" runs in the page's own world (window variables, frameworks) and is visible to it. With ref/selector or arg, expression must be a function, called as (element, arg) => ...; e.g. expression \"(el) => el.href\" with ref \"e5\". Without them, a function written as the whole expression is called with no arguments, so \"() => document.title\" works like \"document.title\". frame (a selector of an <iframe>) runs in that frame. Results over 100k characters are cut (value is then null and truncated says why). Results are returned as-is, without secret redaction.";
+
+/// What eval returns as structured content (MCP outputSchema): clients that read it get the value itself, not JSON text.
+fn eval_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "value": { "description": "The result as a JSON value; null when there is none." },
+            "hint": { "type": "string", "description": "Why there is no value, when the code returned nothing." },
+            "truncated": { "type": "string", "description": "Set when the result was too large to return." },
+            "warnings": { "type": "array", "items": { "type": "string" }, "description": "What browse noticed while the call ran, e.g. a blocked navigation." },
+        },
+        "required": ["value"],
+    })
+}
 
 fn eval_schema() -> Value {
     object(
@@ -1912,16 +2033,26 @@ fn dialog_schema() -> Value {
     )
 }
 
-const UPLOAD: &str = "Set the files of a file input (input[type=file], or its label) without opening the file chooser. files are absolute paths inside browse's file roots, on the machine browse runs on. When the browser is on that machine and can read the files, it takes them straight from disk (no size limit, real input and change events); otherwise browse copies them in, at most 50 MB per call. The reply's via says whether the browser read them from disk (paths) or browse copied them in (copy).";
+const UPLOAD: &str = "Set the files of a file input (input[type=file], or its label) without opening the file chooser. It also accepts a button or element that opens a file chooser: browse clicks it, then sets the files on the input the chooser would fill. files are absolute paths inside browse's file roots, on the machine browse runs on, or inline { name, data } objects whose data is the file's bytes as base64 (for files on another machine). When the browser is on that machine and can read the paths, it takes them straight from disk (no size limit, real input and change events); otherwise browse copies them in, at most 50 MB per call (the limit is for paths copied in). Inline files always copy in and fit about 10 MB per call, and mixing them with paths copies the paths in too. The reply's via says whether the browser read them from disk (paths) or browse copied them in (copy).";
 
 fn upload_schema() -> Value {
-    object(
-        target_props(props(json!({
-            "files": { "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
-            "timeout": { "type": "integer" },
-        }))),
-        &["files"],
-    )
+    let inline = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "A plain file name, with no folders." },
+            "data": { "type": "string", "description": "The file's bytes, base64." },
+            "mimeType": { "type": "string" },
+            "lastModified": { "type": "integer", "description": "Milliseconds since the epoch." },
+        },
+        "required": ["name", "data"],
+    });
+    let item = json!({ "anyOf": [{ "type": "string" }, inline.clone()] });
+    let mut p = target_props(props(json!({
+        "files": { "anyOf": [{ "type": "string" }, inline, { "type": "array", "items": item }] },
+        "timeout": { "type": "integer" },
+    })));
+    p.insert("selector".into(), json!({ "type": "string", "description": "CSS or Playwright selector for the file input, its label, or the button or element that opens its file chooser, used when there is no ref. Must match exactly one element." }));
+    object(p, &["files"])
 }
 
 const EMULATE: &str = "Change how the tab presents itself: viewport { width, height, deviceScaleFactor, mobile } (or \"reset\"), colorScheme, reducedMotion, forcedColors, contrast, media (\"print\"), userAgent, geolocation { latitude, longitude } (the site still needs the user's permission), touch, offline. \"reset\" restores a setting. Permissions can't be granted.";
@@ -1966,7 +2097,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use browse_core::{Browser, Cdp, HandoffResult, TabId, TabInfo};
+    use browse_core::{Browser, HandoffResult, TabDriver, TabId, TabInfo, TabState};
 
     /// A browser whose only tab is read-only; CDP work is counted, so a refusal can be shown to come before it.
     #[derive(Default)]
@@ -1985,9 +2116,9 @@ mod tests {
         async fn close_tab(&self, _tab: TabId) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn cdp(&self, _tab: TabId) -> anyhow::Result<Arc<dyn Cdp>> {
+        async fn tab_driver(&self, _tab: TabId) -> anyhow::Result<Arc<dyn TabDriver>> {
             self.cdp_calls.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("CDP was used")
+            anyhow::bail!("driver was used")
         }
         async fn state(&self, _tab: TabId) -> anyhow::Result<Arc<TabState>> {
             self.cdp_calls.fetch_add(1, Ordering::SeqCst);

@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use browse_core::{CdpEvent, TabOptions, TabState, Tool};
+use browse_cdp::CdpEvent;
+use browse_core::{HandoffInfo, TabOptions, TabState, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, oneshot};
@@ -93,6 +94,8 @@ pub struct Tab {
     pub child_frames: HashSet<String>,
     /// The one CDP handle tools get for this attachment.
     pub cdp: Option<Arc<crate::cdp::TabCdp>>,
+    /// The one protocol-agnostic TabDriver tools get for this attachment.
+    pub driver: Option<Arc<dyn browse_core::TabDriver>>,
 }
 
 impl Tab {
@@ -144,6 +147,13 @@ pub struct Handoff {
     /// The process whose call waits for it.
     pub pid: Option<u32>,
     pub done: Option<oneshot::Sender<&'static str>>,
+}
+
+impl Handoff {
+    /// How a tab's info shows it: what the user is asked to do, and since when.
+    pub fn info(&self) -> HandoffInfo {
+        HandoffInfo { message: self.message.clone(), started_at: self.started_at.clone() }
+    }
 }
 
 #[derive(Default)]
@@ -208,6 +218,16 @@ pub struct State {
 }
 
 impl State {
+    /// Ends the running calls among `ids` that work in `tab`, with `message` as their error; returns how many.
+    pub fn stop_calls_with_ids(&mut self, ids: &[u64], tab: i64, message: &str) -> usize {
+        let picked: Vec<u64> = ids.iter().copied().filter(|id| self.calls.get(id).is_some_and(|call| call.tabs.contains(&tab))).collect();
+        for id in &picked {
+            self.stopped.insert(*id, message.to_string());
+            self.calls[id].abort.abort();
+        }
+        picked.len()
+    }
+
     pub fn link(&self, key: &str) -> Option<Arc<Link>> {
         self.links.iter().find(|l| l.key == key).cloned()
     }

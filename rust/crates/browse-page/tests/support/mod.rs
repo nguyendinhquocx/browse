@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use browse_core::{Browser, Cdp, CdpError, CdpEvent, HandoffResult, TabId, TabInfo, TabOptions, TabState, ToolContext, ToolOutput};
+use browse_cdp::{Cdp, CdpError, CdpEvent};
+use browse_core::{Browser, HandoffResult, TabDriver, TabId, TabInfo, TabOptions, TabState, ToolContext, ToolOutput};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -175,6 +176,7 @@ pub struct TabCdp {
     pub target: String,
     events: broadcast::Sender<CdpEvent>,
     pub sent: Mutex<Vec<String>>,
+    calls: Mutex<Vec<(String, String, Value)>>,
     /// Methods that answer with a protocol error, like an extension without file URL access does.
     refusing: Mutex<HashSet<String>>,
     /// A path that replaces every DOM.setFileInputFiles path, for a browser that sees another filesystem.
@@ -188,7 +190,7 @@ impl TabCdp {
         let attached = connection.send("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None).await.unwrap();
         let session = attached["sessionId"].as_str().unwrap().to_string();
         let (events, _) = broadcast::channel(4096);
-        let tab = Arc::new(TabCdp { connection: connection.clone(), session: session.clone(), target, events, sent: Mutex::new(Vec::new()), refusing: Mutex::new(HashSet::new()), rewrite_files: Mutex::new(None) });
+        let tab = Arc::new(TabCdp { connection: connection.clone(), session: session.clone(), target, events, sent: Mutex::new(Vec::new()), calls: Mutex::new(Vec::new()), refusing: Mutex::new(HashSet::new()), rewrite_files: Mutex::new(None) });
         let mut rx = connection.events.subscribe();
         let forward = tab.events.clone();
         let root = session.clone();
@@ -213,6 +215,11 @@ impl TabCdp {
 
     pub fn methods(&self) -> Vec<String> {
         self.sent.lock().unwrap().clone()
+    }
+
+    /// Every command with the session it went to and the parameters it was sent, in order.
+    pub fn calls(&self) -> Vec<(String, String, Value)> {
+        self.calls.lock().unwrap().clone()
     }
 
     /// Makes `method` answer with a protocol error, as an extension without file URL access does for
@@ -248,6 +255,7 @@ impl Cdp for TabCdp {
                 }
             }
         let session = session_id.unwrap_or(&self.session);
+        self.calls.lock().unwrap().push((method.to_string(), session.to_string(), params.clone()));
         self.connection.send(method, params, Some(session)).await.map_err(CdpError::Protocol)
     }
 
@@ -259,6 +267,7 @@ impl Cdp for TabCdp {
 /// One Chromium tab as the browser: tab 1.
 pub struct FakeBrowser {
     pub tab: Arc<TabCdp>,
+    pub driver: Arc<dyn TabDriver>,
     pub human: bool,
     pub read_only: bool,
     pub connected_locally: bool,
@@ -280,14 +289,15 @@ impl Browser for FakeBrowser {
             chosen: None,
             last_used: None,
             busy: false,
+            handoff: None,
             options: TabOptions { read_only: self.read_only, ..TabOptions::default() },
         }])
     }
     async fn close_tab(&self, _tab: TabId) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn cdp(&self, _tab: TabId) -> anyhow::Result<Arc<dyn Cdp>> {
-        Ok(self.tab.clone())
+    async fn tab_driver(&self, _tab: TabId) -> anyhow::Result<Arc<dyn TabDriver>> {
+        Ok(self.driver.clone())
     }
     async fn state(&self, _tab: TabId) -> anyhow::Result<Arc<TabState>> {
         Ok(self.state.clone())
@@ -341,7 +351,8 @@ impl Harness {
         let tab = TabCdp::open(&connection).await;
         let files = TempDir::new("files");
         let state = Arc::new(TabState::default());
-        let ctx = ToolContext { browser: Arc::new(FakeBrowser { tab: tab.clone(), human, read_only, connected_locally, state: state.clone() }), file_roots: vec![files.0.clone()] };
+        let driver: Arc<dyn TabDriver> = browse_cdp::CdpTabDriver::new(tab.clone());
+        let ctx = ToolContext { browser: Arc::new(FakeBrowser { tab: tab.clone(), driver, human, read_only, connected_locally, state: state.clone() }), file_roots: vec![files.0.clone()] };
         let server = Server::start().await;
         Some(Harness { chrome, tab, ctx, tools: browse_page::tools(), state, server, files })
     }

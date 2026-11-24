@@ -5,7 +5,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use browse_core::{Browser, CdpError, TabOptions, ToolContext};
+use browse_cdp::CdpError;
+use browse_core::{Browser, TabOptions, ToolContext};
 use futures_util::{SinkExt, StreamExt};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serde_json::{Value, json};
@@ -122,6 +123,8 @@ impl Seen {
 struct TargetAnswers {
     queued: HashMap<i64, VecDeque<String>>,
     held: HashMap<i64, Arc<Notify>>,
+    /// What `Page.enable` answers instead of succeeding, until the test clears it.
+    refuse: Option<String>,
 }
 
 type TargetUrls = Arc<Mutex<TargetAnswers>>;
@@ -185,6 +188,14 @@ fn fake_extension_with_urls(socket: Socket, next_tab: i64, urls: TargetUrls) -> 
                         }
                         json!({ "targetInfo": { "targetId": format!("T{tab}"), "type": "page", "url": url, "title": "", "attached": true } })
                     }
+                    "Page.enable" => {
+                        let refusal = urls.lock().unwrap().refuse.clone();
+                        if let Some(message) = refusal {
+                            let _ = replies.send(json!({ "id": id, "error": message }));
+                            continue;
+                        }
+                        json!({})
+                    }
                     "Runtime.evaluate" => json!({ "result": { "type": "number", "value": 42 } }),
                     "Network.getCookies" => json!({ "cookies": [{ "domain": "example.com" }, { "domain": "bank.com" }] }),
                     "Big.method" => json!({ "result": { "type": "string", "value": "x".repeat(params["params"]["bytes"].as_u64().unwrap_or(0) as usize) } }),
@@ -216,6 +227,17 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+async fn eventually_within(what: &str, limit: Duration, check: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("timed out waiting for {what}");
 }
@@ -479,6 +501,43 @@ async fn navigation_respects_the_tab_allowlist() {
     events.send(json!({ "method": "debugger.event", "params": { "tabId": 9, "method": "Page.frameNavigated", "params": { "frame": { "id": "T9", "url": "https://evil.test/" } } } })).unwrap();
     eventually("the tab to be sent back", || seen.cdp("Page.navigate").iter().any(|c| c["params"]["params"]["url"] == "about:blank")).await;
     assert!(relay.st().tabs[&9].warnings[0].contains("Domain allowlist"), "the tab carries the news to its next call");
+}
+
+/// A navigate call whose page the allowlist sends back ends with the allowlist's error right away; other calls keep
+/// getting it as a warning.
+#[tokio::test]
+async fn an_allowlist_block_ends_the_navigate_call_that_caused_it() {
+    let (h, _seen, events) = connected("profile-allow-nav", 300).await;
+    let relay = h.handle.relay.clone();
+    let strict = TabOptions { allowed_origins: Some(vec!["example.com".into()]), ..TabOptions::default() };
+    let tab = h.handle.browser().open_tab(None, &strict).await.unwrap().tab;
+    let running = |id: u64, tool: &str| {
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        relay.inflight.lock().unwrap().insert(id, crate::relay::InFlight { tool: tool.into(), tab: Some(tab), since: std::time::Instant::now() });
+        relay.call_started(id, task.abort_handle(), None, None);
+        relay.st().calls.get_mut(&id).unwrap().tabs.insert(tab);
+        task
+    };
+    let leave = |url: &str| {
+        let main = relay.st().tabs[&tab].main_frame.clone().unwrap_or_else(|| relay.st().tabs[&tab].target_id.clone());
+        events.send(json!({ "method": "debugger.event", "params": { "tabId": tab, "method": "Page.frameNavigated", "params": { "frame": { "id": main, "url": url } } } })).unwrap();
+    };
+
+    let navigate = running(1, "navigate");
+    leave("https://evil.test/");
+    eventually("the navigate call to stop", || navigate.is_finished()).await;
+    let error = relay.st().stopped.get(&1).cloned().unwrap_or_default();
+    assert!(error.starts_with(&format!("Domain allowlist: tab {tab} went to https://evil.test/")), "{error}");
+    assert!(relay.st().tabs[&tab].warnings.is_empty(), "the error carries the news, not a warning as well");
+    relay.call_finished(1);
+    relay.inflight.lock().unwrap().remove(&1);
+
+    let click = running(2, "click");
+    leave("https://evil.test/again");
+    eventually("the warning", || !relay.st().tabs[&tab].warnings.is_empty()).await;
+    assert!(!click.is_finished(), "only navigate calls end early");
+    relay.call_finished(2);
+    click.abort();
 }
 
 #[tokio::test]
@@ -825,6 +884,42 @@ async fn another_extensions_popup_blocks_the_tab_without_dropping_it() {
 
     events.send(page("Page.frameDetached", json!({ "frameId": "PM" }))).unwrap();
     eventually("the block to lift", || relay.st().tabs.get(&tab).is_some_and(|t| !t.protected_ui)).await;
+}
+
+/// Chrome reports a foreign extension frame taking over as target_closed and the extension attaches again. The relay
+/// sets the tab up again, which the same foreign frame can refuse: the tab stays, blocked, and is set up once it goes.
+#[tokio::test]
+async fn a_renewed_debugger_blocked_by_another_extension_keeps_the_tab() {
+    let answers = TargetUrls::default();
+    let (h, seen, events) = connected_with_urls("profile-renew-blocked", 55, answers.clone()).await;
+    let relay = h.handle.relay.clone();
+    let browser = h.handle.browser();
+    let tab = browser.open_tab(None, &TabOptions::default()).await.unwrap().tab;
+    answers.lock().unwrap().refuse = Some("Cannot access a chrome-extension:// URL of different extension".into());
+    events.send(json!({ "method": "debugger.detached", "params": { "tabId": tab, "reason": "target_closed", "reattached": true } })).unwrap();
+    eventually("the tab to be marked blocked", || relay.st().tabs.get(&tab).is_some_and(|t| t.protected_ui)).await;
+
+    let enables = seen.cdp("Page.enable").len();
+    answers.lock().unwrap().refuse = None;
+    eventually_within("the tab to be set up again", Duration::from_secs(5), || {
+        seen.cdp("Page.enable").len() > enables && relay.st().tabs.get(&tab).is_some_and(|t| !t.protected_ui)
+    })
+    .await;
+    assert!(relay.st().tabs.contains_key(&tab), "the tab stays the agent's");
+}
+
+#[tokio::test]
+async fn a_renewed_debugger_that_fails_for_another_reason_drops_the_tab() {
+    let answers = TargetUrls::default();
+    let (h, _seen, events) = connected_with_urls("profile-renew-failed", 56, answers.clone()).await;
+    let relay = h.handle.relay.clone();
+    let browser = h.handle.browser();
+    let tab = browser.open_tab(None, &TabOptions::default()).await.unwrap().tab;
+    answers.lock().unwrap().refuse = Some("Internal error".into());
+    events.send(json!({ "method": "debugger.detached", "params": { "tabId": tab, "reason": "target_closed", "reattached": true } })).unwrap();
+    eventually("the tab to go", || !relay.st().tabs.contains_key(&tab)).await;
+    let error = browser.cdp(tab).await.err().unwrap().to_string();
+    assert!(error.contains("gone (Chrome detached browse from it)"), "{error}");
 }
 
 #[tokio::test]
@@ -1485,6 +1580,41 @@ async fn a_chosen_id_is_get_or_create_and_listed_with_the_callers_id() {
         assert!(output.is_error && tool_text(&output).contains("lowercase slug"), "{bad}: {}", tool_text(&output));
     }
     assert_eq!(seen.commands("tabs.create").len(), 1, "a refused id opens nothing");
+}
+
+/// A tab with a handoff waits on the user: `tabs` and `status` say so, with the message and since when, and
+/// stop saying so once it finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_handoff_is_listed_with_its_message_and_clears_after() {
+    let (h, _seen, _events) = connected("profile-handoff-listing", 310).await;
+    let relay = h.handle.relay.clone();
+    let browser = h.handle.browser();
+    let waiting = browser.open_tab(None, &TabOptions::default()).await.unwrap().tab;
+    let quiet = browser.open_tab(None, &TabOptions::default()).await.unwrap().tab;
+    let call = {
+        let relay = relay.clone();
+        tokio::spawn(async move { tool(&relay, "handoff", json!({ "message": "finish the checkout", "tab": waiting, "timeoutSeconds": 30 })).await })
+    };
+    eventually("the handoff", || relay.st().handoffs.contains_key(&waiting)).await;
+
+    let entry = |listed: &Value, tab: i64| listed["tabs"].as_array().unwrap().iter().find(|t| t["tab"] == tab).cloned().unwrap();
+    let listed = text(&serde_json::to_value(tool(&relay, "tabs", json!({})).await).unwrap());
+    let on = entry(&listed, waiting);
+    assert_eq!(on["handoff"]["message"], "finish the checkout", "{on}");
+    assert!(on["handoff"]["startedAt"].as_str().is_some_and(|time| time.ends_with('Z')), "ISO 8601 UTC like lastUsed: {on}");
+    assert_eq!(on["busy"], true, "{on}");
+    assert!(entry(&listed, quiet).get("handoff").is_none(), "a tab with no handoff says nothing about one: {listed}");
+
+    // `status` lists the same shape from the same state.
+    let status = text(&serde_json::to_value(tool(&relay, "status", json!({})).await).unwrap());
+    assert_eq!(entry(&status, waiting)["handoff"], on["handoff"], "{status}");
+    assert!(entry(&status, quiet).get("handoff").is_none(), "{status}");
+
+    // It clears with the handoff, not by being copied into the listing.
+    relay.finish_handoff(waiting, "continued");
+    tokio::time::timeout(Duration::from_secs(5), call).await.unwrap().unwrap();
+    let listed = text(&serde_json::to_value(tool(&relay, "tabs", json!({})).await).unwrap());
+    assert!(entry(&listed, waiting).get("handoff").is_none(), "the handoff finished: {listed}");
 }
 
 #[tokio::test]
