@@ -25,6 +25,9 @@ use crate::util::{b64url, from_b64url, random_bytes};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[path = "drivers_tests.rs"]
+mod drivers_tests;
+
 struct Harness {
     handle: RelayHandle,
     paths: Paths,
@@ -475,7 +478,7 @@ async fn the_client_name_decides_tools_and_instructions() {
     assert_eq!(names(get("/tools", "claude-code").await), ["status", "tabs"]);
     assert!(names(get("/tools", "opencode").await).contains(&"handoff".to_string()));
     let plain = get("/instructions", "opencode").await;
-    assert!(plain["instructions"].as_str().unwrap().contains("Tabs are the handle"), "{plain}");
+    assert!(plain["instructions"].as_str().unwrap().contains("Pass that `tab` to every other tool"), "{plain}");
     let scripted = get("/instructions", "cursor").await;
     assert!(scripted["instructions"].as_str().unwrap().contains("execute"), "{scripted}");
 }
@@ -654,6 +657,7 @@ fn retaking_the_state_lock_panics_instead_of_deadlocking() {
         version: "0".into(),
         build_id: String::new(),
         auto_update: None,
+        firefox: None,
     })
     .unwrap();
     let held = relay.st();
@@ -674,6 +678,7 @@ fn the_state_lock_can_be_taken_again_once_released() {
         version: "0".into(),
         build_id: String::new(),
         auto_update: None,
+        firefox: None,
     };
     let one = crate::relay::Relay::new(config(paths.clone())).unwrap();
     let two = crate::relay::Relay::new(config(paths.clone())).unwrap();
@@ -700,6 +705,7 @@ fn an_address_never_replaces_a_known_browser_name() {
         version: "0".into(),
         build_id: String::new(),
         auto_update: None,
+        firefox: None,
     })
     .unwrap();
     let mut st = relay.st();
@@ -847,6 +853,7 @@ fn a_persist_queued_after_the_final_one_does_nothing() {
         version: "0".into(),
         build_id: String::new(),
         auto_update: None,
+        firefox: None,
     })
     .unwrap();
     relay.persist_now();

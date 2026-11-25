@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod domain;
+pub mod firefox;
 pub mod guardrails;
 pub mod log;
 pub mod origins;
@@ -21,7 +22,9 @@ pub mod surface;
 mod browser;
 mod cdp;
 mod demonstrate;
+mod drivers;
 mod extension;
+mod handoff_card;
 mod handshake;
 mod link;
 mod presentation;

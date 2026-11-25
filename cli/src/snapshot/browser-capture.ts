@@ -101,7 +101,10 @@ const captureSnapshotInBrowser = (
       if (headerRow) {
         const headers = headerRow.headers
         if (headers.length === values.length && headers.every(Boolean)) {
-          return values.map((value, index) => `${headers[index]}: ${value}`).join(" | ")
+          // The header row prints as its own line above, so a data row carries only its values. When it won't print
+          // (hidden, or outside a `within` root), each value keeps its column name.
+          const headerShown = isVisible(headerRow.row) && Boolean(root?.contains(headerRow.row))
+          return headerShown ? values.join(" | ") : values.map((value, index) => `${headers[index]}: ${value}`).join(" | ")
         }
       }
       if (headerCells.length === cells.length) return values.join(" | ")
@@ -859,6 +862,8 @@ const captureSnapshotInBrowser = (
       : ""
     const name = truncate(displayName || fallbackName, isParagraph || isSafetyText || isStructural ? 180 : 120)
     if (!name) continue
+    // A stand-in like "List" or the role itself isn't a name the element has, so it isn't printed as one.
+    const unnamed = !displayName && (!isInteractive || fallbackName === role)
     const details = isHeading ? `level=${headingDepth(element) + 1}` : isFrame ? frameSource(element) : detailsFor(element)
     const primaryLink = (role === "link" && isPrimaryLink(element)) || headerCandidateSet.has(element)
     const baseDepth = headingDepth(element)
@@ -887,6 +892,7 @@ const captureSnapshotInBrowser = (
       ...(parentKeys.length > 0 ? { parentKeys } : {}),
       role,
       name,
+      ...(unnamed ? { unnamed: true } : {}),
       ...(element === root ? { root: true } : {}),
       ...(isInteractive && identityName && !labelProxy ? { identityName } : {}),
       ...(labelProxy ? { selectorRole: "label" } : {}),

@@ -221,6 +221,45 @@ async fn snapshot_main_scope_and_iframes_outside_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn table_rows_name_their_columns_once() {
+    let h = harness!(false);
+    let table = |id: &str, head: &str| format!("<table id={id}><thead{head}><tr><th>Team</th><th>Wins</th></tr></thead><tbody><tr id={id}-a><td>Islanders</td><td>25</td></tr><tr><td>Rangers</td><td>36</td></tr></tbody></table>");
+    let page = format!("<!doctype html><title>Teams</title>{}{}<button id=win onclick=\"document.querySelector('#shown tr:last-child td:last-child').textContent='37'\">Win</button>", table("shown", ""), table("hidden", " style=\"display:none\""));
+    let url = h.server.page("/teams", &page);
+    h.json("navigate", json!({ "url": url })).await;
+
+    let snapshot = h.ok("snapshot", json!({})).await;
+    assert!(snapshot.contains("- row \"Team | Wins\"\n  - row \"Islanders | 25\"\n  - row \"Rangers | 36\""), "{snapshot}");
+    // A hidden header row doesn't print, so its table's rows keep the column names.
+    assert!(snapshot.contains("- row \"Team: Islanders | Wins: 25\""), "{snapshot}");
+    let row = h.ok("snapshot", json!({ "within": "#shown-a" })).await;
+    assert!(row.contains("Team: Islanders | Wins: 25"), "{row}");
+
+    let found = h.ok("snapshot", json!({ "find": "Rangers", "context": 0 })).await;
+    assert!(found.contains("- row \"Team | Wins\"\n...\n  - row \"Rangers | 36\""), "{found}");
+
+    h.ok("snapshot", json!({})).await;
+    h.ok("click", json!({ "selector": "#win" })).await;
+    let diff = h.ok("snapshot", json!({ "diff": true })).await;
+    assert!(diff.contains("    row \"Team | Wins\"\n-   row \"Rangers | 36\"\n+   row \"Rangers | 37\""), "{diff}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn elements_without_a_name_show_none() {
+    let h = harness!(false);
+    let url = h.server.page("/unnamed", "<!doctype html><title>Unnamed</title><button onclick=\"this.textContent='Saved'\"></button><input name=q><ul><li>One</li><li>Two</li></ul>");
+    h.json("navigate", json!({ "url": url })).await;
+    let snapshot = h.ok("snapshot", json!({})).await;
+    let button = ref_of(&snapshot, "- button [");
+    assert!(snapshot.contains("- textbox \"q\" [ref="), "a name attribute still names it: {snapshot}");
+    assert!(snapshot.contains("- list [2 items]"), "{snapshot}");
+    assert!(!snapshot.contains("\"button\"") && !snapshot.contains("\"List\""), "{snapshot}");
+    // The ref works the same without a name.
+    h.ok("click", json!({ "ref": button })).await;
+    assert!(h.ok("snapshot", json!({})).await.contains("- button \"Saved\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refs_carry_through_find_snapshots() {
     let h = harness!(false);
     let url = h.server.page("/refs-find", "<!doctype html><button>Start</button>");
@@ -302,6 +341,7 @@ async fn covered_elements_fail_fast_and_dialogs_pause() {
 
     let clicked = h.json("click", json!({ "selector": "#alert" })).await;
     assert_eq!(clicked["dialog"]["type"], "confirm", "{clicked}");
+    assert!(clicked["clicked"].as_str().is_some_and(|label| label.contains("button \"Ask\"")), "{clicked}");
     let blocked = h.err("snapshot", json!({})).await;
     assert!(blocked.contains("dialog is open"), "{blocked}");
     let status = h.json("dialog", json!({})).await;
@@ -313,6 +353,24 @@ async fn covered_elements_fail_fast_and_dialogs_pause() {
     h.ok("click", json!({ "selector": "#alert" })).await;
     let title = h.ok("eval", json!({ "expression": "document.title" })).await;
     assert_eq!(title, "\"false\"");
+}
+
+/// A dialog browse answers itself doesn't stop the rest of an input action: the keys after the one that opened
+/// it are still typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_auto_answered_dialog_does_not_stop_typing() {
+    let h = harness!(false);
+    let url = h.server.page(
+        "/auto-dialog-typing",
+        r#"<!doctype html><title>Typing</title>
+<input id="field" onkeydown="if (event.key === 'b' && !window.asked) { window.asked = true; document.title = String(confirm('Proceed?')) }">"#,
+    );
+    h.ok("navigate", json!({ "url": url })).await;
+    h.ok("dialog", json!({ "auto": "accept" })).await;
+    let typed = h.json("type", json!({ "selector": "#field", "text": "abcde" })).await;
+    let value = h.ok("eval", json!({ "expression": "document.getElementById('field').value" })).await;
+    assert_eq!(value, "\"abcde\"", "{typed}");
+    assert_eq!(typed["typed"], 5, "{typed}");
 }
 
 /// fill checks what a click checks on text fields: one under an overlay fails without force and is left untouched,

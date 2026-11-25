@@ -44,7 +44,7 @@ const INPUT_TOOLS: &[&str] = &["click", "fill", "type", "press", "select", "hove
 #[async_trait]
 impl Tool for PageTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec { name: self.name.into(), description: self.description.into(), input_schema: (self.schema)(), output_schema: (self.name == "eval").then(eval_output_schema) }
+        ToolSpec { name: self.name.into(), description: self.description.into(), input_schema: (self.schema)(), output_schema: output_schema(self.name) }
     }
 
     async fn call(&self, ctx: ToolContext, args: Value) -> Result<ToolOutput> {
@@ -191,27 +191,28 @@ fn map(value: Value) -> Map<String, Value> {
 /// Runs an input action, then reports what it changed. A dialog that opens mid-action ends the action normally.
 async fn run_action<F>(c: &Ctx, options: AfterOptions, action: F) -> Result<ToolOutput>
 where
-    F: for<'a, 'b> FnOnce(&'a Ctx, &'a mut Input<'b>) -> Pin<Box<dyn Future<Output = Result<Map<String, Value>>> + Send + 'a>>,
+    F: for<'a, 'b> FnOnce(&'a Ctx, &'a mut Input<'b>, &'a mut Map<String, Value>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>,
 {
     c.page.ensure_no_dialog()?;
     let before = aftermath::before(&c.ctx, &c.page).await;
     let human = human_enabled(&c.ctx, &c.page).await;
+    let mut base = Map::new();
     let outcome = {
         let mut input = Input::new(&c.page, human).await;
-        let outcome = action(c, &mut input).await;
+        let outcome = action(c, &mut input, &mut base).await;
         if outcome.as_ref().err().map(|e| e.downcast_ref::<Interrupted>().is_none()).unwrap_or(false) {
             input.reset().await;
         }
         outcome
     };
-    let base = match outcome {
-        Ok(base) => base,
-        Err(error) if error.downcast_ref::<Interrupted>().is_some() => Map::new(),
+    match outcome {
+        Ok(()) => {}
+        Err(error) if error.downcast_ref::<Interrupted>().is_some() => {}
         Err(error) => {
             c.page.release().await;
             return Err(error);
         }
-    };
+    }
     let extra = aftermath::after(&c.ctx, &c.page, &before, options).await;
     c.page.release().await;
     Ok(result(base, extra))
@@ -369,9 +370,8 @@ async fn click(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let count = args.get("clickCount").and_then(Value::as_i64).unwrap_or(if bool_arg(&args, "double") { 2 } else { 1 }).clamp(1, 3);
     let modifiers = modifiers_arg(&args);
     let options = pointer_options(&args, true);
-    run_action(&c, AfterOptions::default(), move |c, input| {
+    run_action(&c, AfterOptions::default(), move |c, input, out| {
         Box::pin(async move {
-            let mut out = Map::new();
             let at = match (&spec, point) {
                 (Some(spec), _) => {
                     let (resolved, at) = actions::locate(&c.page, &c.tab_state, input, spec, options).await?;
@@ -391,7 +391,7 @@ async fn click(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             let held = actions::with_modifiers(input, &modifiers).await?;
             input.click(at, &button, count).await?;
             actions::release_modifiers(input, &held).await?;
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -405,9 +405,8 @@ async fn hover(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
         bail!("hover needs a ref, a selector, or x and y");
     }
     let options = pointer_options(&args, false);
-    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input| {
+    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input, out| {
         Box::pin(async move {
-            let mut out = Map::new();
             let at = match (&spec, point) {
                 (Some(spec), _) => {
                     let (resolved, at) = actions::locate(&c.page, &c.tab_state, input, spec, options).await?;
@@ -418,7 +417,7 @@ async fn hover(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 (None, None) => unreachable!(),
             };
             input.move_to(at, 1).await?;
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -460,7 +459,7 @@ async fn fill(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let timeout = timeout_arg(&args, ACTION_TIMEOUT_MS);
     let force = bool_arg(&args, "force");
     let submit = bool_arg(&args, "submit");
-    run_action(&c, AfterOptions::default(), move |c, input| {
+    run_action(&c, AfterOptions::default(), move |c, input, out| {
         Box::pin(async move {
             let mut filled: Vec<Value> = Vec::new();
             for field in &fields {
@@ -477,12 +476,11 @@ async fn fill(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             if submit {
                 input.press("Enter").await?;
             }
-            let mut out = Map::new();
             out.insert("filled".into(), json!(filled));
             if submit {
                 out.insert("submitted".into(), json!(true));
             }
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -600,9 +598,8 @@ async fn type_tool(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let text = str_arg(&args, "text").ok_or_else(|| anyhow!("type needs text"))?.to_string();
     let delay = args.get("delay").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 2_000.0);
     let submit = bool_arg(&args, "submit");
-    run_action(&c, AfterOptions::default(), move |c, input| {
+    run_action(&c, AfterOptions::default(), move |c, input, out| {
         Box::pin(async move {
-            let mut out = Map::new();
             if let Some(target) = focus_target(c, input, &args).await? {
                 out.insert("target".into(), target);
             }
@@ -611,7 +608,7 @@ async fn type_tool(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 input.press("Enter").await?;
             }
             out.insert("typed".into(), json!(text.chars().count()));
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -625,9 +622,8 @@ async fn press(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
         _ => bail!("press needs a key, like \"Enter\", \"Control+A\" or [\"Tab\", \"Tab\", \"Enter\"]"),
     };
     let count = args.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 100);
-    run_action(&c, AfterOptions::default(), move |c, input| {
+    run_action(&c, AfterOptions::default(), move |c, input, out| {
         Box::pin(async move {
-            let mut out = Map::new();
             if let Some(target) = focus_target(c, input, &args).await? {
                 out.insert("target".into(), target);
             }
@@ -637,7 +633,7 @@ async fn press(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 }
             }
             out.insert("pressed".into(), json!(keys));
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -696,14 +692,13 @@ async fn select(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
         })
         .collect::<Result<_>>()?;
     let timeout = timeout_arg(&args, ACTION_TIMEOUT_MS);
-    run_action(&c, AfterOptions::default(), move |c, _input| {
+    run_action(&c, AfterOptions::default(), move |c, _input, out| {
         Box::pin(async move {
             let resolved = target::resolve(&c.page, &c.tab_state, &spec, ResolveOptions { timeout, act: true }).await?;
             let selected = select_options(c, &resolved.element, &options, timeout).await?;
-            let mut out = Map::new();
             out.insert("target".into(), target_label(&spec, &resolved.label));
             out.insert("selected".into(), selected);
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -730,9 +725,8 @@ async fn drag(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let (to_spec, to_point) = endpoint(args.get("to"), "to")?;
     let steps = args.get("steps").and_then(Value::as_u64).unwrap_or(10).clamp(1, 100) as usize;
     let options = pointer_options(&args, true);
-    run_action(&c, AfterOptions::default(), move |c, input| {
+    run_action(&c, AfterOptions::default(), move |c, input, out| {
         Box::pin(async move {
-            let mut out = Map::new();
             let from = match &from_spec {
                 Some(spec) => {
                     let (resolved, at) = actions::locate(&c.page, &c.tab_state, input, spec, options).await?;
@@ -753,7 +747,7 @@ async fn drag(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             if outcome == DragOutcome::Dropped {
                 out.insert("html5".into(), json!(true));
             }
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -772,9 +766,8 @@ async fn scroll(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             bail!("to must be top, bottom, left or right");
         }
     let timeout = timeout_arg(&args, ACTION_TIMEOUT_MS);
-    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input| {
+    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input, out| {
         Box::pin(async move {
-            let mut out = Map::new();
             let main = c.page.main_frame();
             let element = match &spec {
                 Some(spec) => Some(target::resolve(&c.page, &c.tab_state, spec, ResolveOptions { timeout, act: true }).await?),
@@ -854,7 +847,7 @@ async fn scroll(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             out.insert("scrollHeight".into(), json!(height));
             out.insert("viewportHeight".into(), json!(client));
             out.insert("atBottom".into(), json!(y + client >= height - 2.0));
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -1070,7 +1063,7 @@ async fn upload(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let files: Vec<UploadFile> = files.iter().map(|file| file.checked(&c.ctx.file_roots)).collect::<Result<_>>()?;
     let timeout = timeout_arg(&args, ACTION_TIMEOUT_MS);
     let explicit_timeout = args.get("timeout").and_then(Value::as_u64).is_some();
-    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input| {
+    run_action(&c, AfterOptions { expect_navigation: false, ..AfterOptions::default() }, move |c, input, out| {
         Box::pin(async move {
             let resolved = target::resolve(&c.page, &c.tab_state, &spec, ResolveOptions { timeout, act: true }).await?;
             let name = if resolved.label.is_empty() { spec.label() } else { resolved.label.clone() };
@@ -1086,11 +1079,10 @@ async fn upload(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 interception.disarm().await;
             }
             let via = sent?;
-            let mut out = Map::new();
             out.insert("target".into(), target_label(&spec, &resolved.label));
             out.insert("files".into(), json!(files.iter().map(UploadFile::name).collect::<Vec<_>>()));
             out.insert("via".into(), json!(via));
-            Ok(out)
+            Ok(())
         })
     })
     .await
@@ -1113,7 +1105,12 @@ impl ChooserInterception {
         let arm = driver.prepare_file_chooser_interception();
         // The guard exists before enabling, so a dropped enable still disarms this generation.
         let guard = Self { driver: driver.clone(), arm, lock: Some(lock) };
-        driver.arm_file_chooser_interception(arm).await.map_err(crate::page::driver_error)?;
+        driver.arm_file_chooser_interception(arm).await.map_err(|error| match error {
+            DriverError::Unsupported(_) => anyhow!(
+                r#"uploading by clicking a button that opens a file chooser is not supported by this browser; target the underlying <input type="file"> directly instead"#,
+            ),
+            other => crate::page::driver_error(other),
+        })?;
         Ok(guard)
     }
 
@@ -1471,7 +1468,7 @@ fn validate_emulate(args: &Value) -> Result<()> {
     }
     for key in ["timezone", "locale"] {
         if args.get(key).is_some() {
-            bail!("emulate can't set {key}: Chrome only allows timezone and locale overrides for trusted clients, not the browser extension browse drives it through.");
+            bail!("emulate can't set {key}: browsers only allow timezone and locale overrides for trusted clients, not the browser extension browse drives them through.");
         }
     }
     let enums: [(&str, &[&str]); 5] = [
@@ -1649,7 +1646,7 @@ async fn emulate(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     }
     if applied.is_empty() {
         let reasons: Vec<String> = failed.iter().map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or(""))).collect();
-        bail!("Chrome rejected every setting: {}", reasons.join("; "));
+        bail!("The browser rejected every setting: {}", reasons.join("; "));
     }
     let mut out = json!({ "applied": applied });
     if !failed.is_empty() {
@@ -1778,7 +1775,8 @@ async fn webmcp_main_world(page: &Arc<TabPage>, frame: &str, method: &str, args:
 
 // Schemas and descriptions.
 
-const TARGET_DOC: &str = "Address elements by `ref` from the latest snapshot (\"e12\"; \"a5\" / \"f1a5\" from an aria snapshot) or by `selector`: CSS, or Playwright selectors such as `role=button[name=\"Save\"]`, `text=Sign in`, `label=Email`, `placeholder=Search`, `testid=submit`, chained with `>>` (`form >> role=button`, `>> nth=0`). Enter an iframe with `iframe[title=\"Pay\"] >> frame >> role=button[name=\"Pay\"]`.";
+const REF_DOC: &str = "Snapshot ref, e.g. \"e12\" (\"a5\" / \"f1a5\" from an aria snapshot).";
+const SELECTOR_DOC: &str = "CSS or Playwright selector, used when there is no ref: Playwright selectors such as `role=button[name=\"Save\"]`, `text=Sign in`, `label=Email`, `placeholder=Search`, `testid=submit`, chained with `>>` (`form >> role=button`, `>> nth=0`). Enter an iframe with `iframe[title=\"Pay\"] >> frame >> role=button[name=\"Pay\"]`. Must match exactly one element.";
 
 fn tab_prop() -> Value {
     browse_core::tab_schema()
@@ -1856,7 +1854,8 @@ fn click_schema() -> Value {
         "force": { "type": "boolean", "description": "Skip the visible/enabled/covered checks." },
         "timeout": { "type": "integer", "description": "Milliseconds to wait for the element (default 10000)." },
     })));
-    p.insert("ref".into(), json!({ "type": "string", "description": TARGET_DOC }));
+    p.insert("ref".into(), json!({ "type": "string", "description": REF_DOC }));
+    p.insert("selector".into(), json!({ "type": "string", "description": SELECTOR_DOC }));
     object(p, &[])
 }
 
@@ -1877,11 +1876,12 @@ fn fill_schema() -> Value {
         "value": { "type": "string" },
         "checked": { "type": "boolean", "description": "For a checkbox, radio or switch." },
         "fields": { "type": "array", "items": field, "description": "Several fields in order, instead of ref/selector + value." },
-        "submit": { "type": "boolean", "description": "Press Enter after filling." },
+        "submit": { "type": "boolean" },
         "force": { "type": "boolean", "description": "Skip the visible/enabled/editable wait and, for text fields, the covered check; checkboxes get the same checks as click." },
         "timeout": { "type": "integer" },
     })));
-    p.insert("ref".into(), json!({ "type": "string", "description": TARGET_DOC }));
+    p.insert("ref".into(), json!({ "type": "string", "description": REF_DOC }));
+    p.insert("selector".into(), json!({ "type": "string", "description": SELECTOR_DOC }));
     object(p, &[])
 }
 
@@ -1892,7 +1892,7 @@ fn type_schema() -> Value {
         target_props(props(json!({
             "text": { "type": "string" },
             "delay": { "type": "number", "description": "Extra milliseconds between keys." },
-            "submit": { "type": "boolean", "description": "Press Enter after typing." },
+            "submit": { "type": "boolean" },
             "timeout": { "type": "integer" },
         }))),
         &["text"],
@@ -1972,6 +1972,55 @@ fn scroll_schema() -> Value {
 }
 
 const EVAL: &str = "Run JavaScript in the page and return its result as { value } (JSON). An expression's value is returned (promises are awaited, await works). Statements (const/let, loops, several lines) return the value of their last expression statement, like a console (`const a = 3; a` gives 3), or what they `return`. Declarations stay local to the call and never leak into the page. DOM nodes come back as \"<tag#id.class>\", Map as an object, Set as an array, Date as an ISO string, Errors as {name, message}, cycles as \"[Circular]\". A script still running at the timeout is stopped. By default it runs in browse's isolated world: it sees the DOM but not the page's own JS globals, and the page can't see it. world \"main\" runs in the page's own world (window variables, frameworks) and is visible to it. With ref/selector or arg, expression must be a function, called as (element, arg) => ...; e.g. expression \"(el) => el.href\" with ref \"e5\". Without them, a function written as the whole expression is called with no arguments, so \"() => document.title\" works like \"document.title\". frame (a selector of an <iframe>) runs in that frame. Results over 100k characters are cut (value is then null and truncated says why). Results are returned as-is, without secret redaction.";
+
+/// What a page tool returns, as an MCP outputSchema. snapshot (text) and webmcp (whatever the page's tool returns) have
+/// none. Actions share what changed on the page (`aftermath`).
+fn output_schema(name: &str) -> Option<Value> {
+    let string = || json!({ "type": "string" });
+    let after = || {
+        json!({
+            "url": string(),
+            "title": string(),
+            "navigated": { "type": "boolean" },
+            "urlChanged": { "type": "boolean" },
+            "from": string(),
+            "status": { "type": "integer" },
+            "redirects": { "type": "integer" },
+            "pending": {},
+            "dialog": { "type": "object", "description": "A dialog the page opened; it is paused until you call dialog" },
+            "newTabs": { "type": "array" },
+            "warning": string(),
+        })
+    };
+    let with = |extra: Value| {
+        let mut properties = after();
+        if let (Some(all), Value::Object(extra)) = (properties.as_object_mut(), extra) {
+            all.extend(extra);
+        }
+        properties
+    };
+    let tab = json!({ "type": "integer", "description": "The tab id: pass it as `tab` to every other tool" });
+    Some(match name {
+        "eval" => return Some(eval_output_schema()),
+        "navigate" => browse_core::output_schema(with(json!({ "tab": tab, "note": string() })), &["tab", "url"]),
+        "click" => browse_core::output_schema(with(json!({ "clicked": string() })), &[]),
+        "fill" => browse_core::output_schema(with(json!({ "filled": { "type": "array", "items": { "type": "object" } }, "submitted": { "type": "boolean" } })), &["filled"]),
+        "type" => browse_core::output_schema(with(json!({ "target": string(), "typed": { "type": "integer" } })), &[]),
+        "press" => browse_core::output_schema(with(json!({ "pressed": { "type": "array", "items": string() }, "target": string() })), &["pressed"]),
+        "select" => browse_core::output_schema(with(json!({ "target": string(), "selected": { "type": "array" } })), &["selected"]),
+        "hover" => browse_core::output_schema(with(json!({ "hovered": string() })), &[]),
+        "drag" => browse_core::output_schema(with(json!({ "from": {}, "to": {}, "html5": { "type": "boolean" } })), &[]),
+        "scroll" => browse_core::output_schema(
+            with(json!({ "scrollY": { "type": "number" }, "scrollHeight": { "type": "number" }, "viewportHeight": { "type": "number" }, "atBottom": { "type": "boolean" }, "target": string() })),
+            &[],
+        ),
+        "wait_for" => browse_core::output_schema(json!({ "ok": { "type": "boolean" }, "waitedFor": string(), "waitedMs": { "type": "integer" }, "url": string(), "dialog": { "type": "object" } }), &["ok"]),
+        "dialog" => browse_core::output_schema(json!({ "dialog": { "description": "The open dialog (type, message), or null" }, "handled": {}, "autoPolicy": string() }), &[]),
+        "upload" => browse_core::output_schema(with(json!({ "target": string(), "files": { "type": "array" } })), &[]),
+        "emulate" => browse_core::output_schema(json!({ "applied": { "type": "object" }, "note": string() }), &["applied"]),
+        _ => return None,
+    })
+}
 
 /// What eval returns as structured content (MCP outputSchema): clients that read it get the value itself, not JSON text.
 fn eval_output_schema() -> Value {
