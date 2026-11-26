@@ -203,13 +203,20 @@ extension from your browser to finish.
   that tab once: asking again returns the same tab without navigating it, and every tool takes `work-mail` as `tab`.
   The id lasts while the tab stays open: a relay restart or extension reload keeps it, and a browser restart loses it
   (opening that id again is a fresh tab). `tabs` lists each tab's id, url, title, group, last use, whether a call is
-  running in it, and a waiting handoff's message. A tab opened with `keepOpen: true` stays until an agent or you close
-  it; every other tab closes when idle like the rest.
+  running in it, the browser window it's in, and a waiting handoff's message. A tab opened with `keepOpen: true` stays
+  until an agent or you close it; every other tab closes when idle like the rest. `keepOpen` needs extension 0.1.2 or
+  newer: an older one can't hold a tab open, so it still closes when idle and browse tells the agent.
+- **A task keeps to its window.** A new tab with a `group` label opens in the window where that label's tabs are, in
+  either window setting, so if you move a task's tabs to a window of their own, its next tabs open there too (when
+  they're split across windows, the one you used last; the agent is told so it can ask you). An agent can also open
+  a task in a new background window (`newWindow`) or in the window of a tab it names (`windowOf`); neither changes
+  your window setting. `OPENCODE_BROWSER_AGENT_WINDOW` fixes placement, so labels don't move tabs while it's set.
 - **Agents open their own tabs** in the background of the window you last used, grouped together and collapsed unless
-  you're looking at one (you can turn that off). Agents can't switch you to their tabs or bring a window to the front.
-  Tabs nobody touches for 10 minutes close by themselves (never while something runs on them). Closing agent tabs never
-  quits the browser or leaves it without a window: browse leaves a new tab (or window) behind when it would close the
-  last one.
+  you're looking at one (you can turn that off). By default, agents can't switch you to their tabs or bring a window to
+  the front. A relay started with `OPENCODE_BROWSER_ALLOW_FOREGROUND=1` lets `page.bringToFront()` in `execute` raise
+  the tab and its window. Tabs nobody touches for 10 minutes close by themselves, or whatever idle close is set to
+  below (never while something runs on them). Closing agent tabs never quits the browser or leaves it without a window:
+  browse leaves a new tab (or window) behind when it would close the last one.
 - **Relay restarts keep agent tabs.** The relay saves the tabs agents opened and their options, and takes them back
   when it starts again (after an update, say).
 - **Hand an agent one of your tabs** by clicking the toolbar button on it. The badge shows **ON**; click again to take
@@ -226,7 +233,11 @@ extension from your browser to finish.
   (`{ name, data }`): those always copy in and fit about 10 MB per call (the 50 MB limit is for paths copied in), and
   mixing them with paths copies the paths in too.
 - **Several browsers at once.** Each connected browser has an id (like `chrome-macbook`); `status` lists them, and new
-  tabs open in the default browser unless `browser` names another.
+  tabs open in the default browser unless `browser` names another. The id comes from the browser's name, or the name
+  set in the extension's settings. Helium tells extensions it is Chrome, so a browser on this computer that says it is
+  Chrome is named Helium (`helium-macbook`) when Helium has browse and no other browser here that could say "Chrome"
+  does. When browse can't tell, a browser already named Helium keeps its name and id. A Chrome browse can't see (a
+  custom profile folder, say) next to Helium may be named Helium too: set a name for it in the extension's settings.
 - **Settings** (the extension's options page, applied right away): where agent tabs open (your window or their own),
   grouping (one shared group, one per task, or none), whether browse collapses agent groups by itself or leaves them
   as you set them (a handoff still opens its group so you can find the tab), when idle tabs close (10, 30, 60 minutes
@@ -333,11 +344,12 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
 | --- | --- |
 | `OPENCODE_BROWSER_ALLOW_ALL_COOKIES=1` | Let tabs read and write every cookie in the profile |
 | `OPENCODE_BROWSER_ALLOW_ALL_STORAGE=1` | Let tabs use every site's storage, and load resources from any host with your credentials |
-| `OPENCODE_BROWSER_ALLOW_FOREGROUND=1` | Allow bringing a tab's window to the front |
+| `OPENCODE_BROWSER_ALLOW_FOREGROUND=1` | Let `page.bringToFront()` in `execute` raise the tab and its window (off by default; `browse restart` after setting it) |
 | `OPENCODE_BROWSER_ALLOW_FILE_URLS=1` | Allow `file:` URLs |
 | `OPENCODE_BROWSER_FILE_ROOTS` | More folders tools may read and write (path-list separated) |
-| `OPENCODE_BROWSER_AGENT_WINDOW=separate` | Open agent tabs in a separate window (`current`: in yours), overriding the options page |
+| `OPENCODE_BROWSER_AGENT_WINDOW=separate` | Open agent tabs in a separate window (`current`: in yours), overriding the options page; labelled tabs no longer follow their label's window |
 | `OPENCODE_BROWSER_HUMAN_INPUT=0` | Send input at full speed; overrides the options page |
+| `OPENCODE_BROWSER_IDLE_TAB_TTL_MS=600000` | Idle close time for tabs in browsers browse drives directly, or an extension too old to have the setting (`0`: never). Agent and lent tabs in the extension follow the idle close setting |
 | `OPENCODE_BROWSER_AUTO_UPDATE=notify` | Only tell about new versions (`off`: check, but never install or tell; `on`: install them, the default) |
 | `OPENCODE_BROWSER_CHALLENGE_WAIT_MS=15000` | How long to wait for a bot check the browser clears by itself |
 | `OPENCODE_BROWSER_EXTENSION_TIMEOUT_MS=30000` | How long the relay waits for the extension to answer a command |
@@ -351,6 +363,9 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
   and says what to do when the extension is missing, unpaired, closed or out of date. A tab waiting on you is marked
   `waiting on you: <message>`, and `browse status --json` or `browse tabs` gives the message and when the handoff
   started (`handoff.message`, `handoff.startedAt`). Agents get the same from the `status` and `tabs` tools.
+  `browse show <tab>` brings that tab to the front, as clicking browse's handoff notification does (with no tab, the
+  only one waiting; `--json` prints `{ tab, url, handoff }`). It only raises a tab with a handoff waiting on you, so
+  agents still can't take your focus with it.
 - After the relay restarts, the extension reconnects by itself within about half a minute; calls made in the meantime
   wait for it.
 - An agent says browse's tools are missing: restart the agent (or reload its MCP servers) after `browse install`.
@@ -363,6 +378,10 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
   the code in the extension's options.
 - An agent says browse was updated and its MCP server must restart: an MCP server started before an update to this
   version can't talk to the new relay. Restart the agent.
+- Windows says "An Application Control policy has blocked this file" (or npm reports `spawn UNKNOWN`): Smart App
+  Control blocks a `browse.exe` without an Authenticode signature, and every install method runs the same binary.
+  Releases are unsigned until Windows signing is turned on ([#317](https://github.com/anomalyco/browse/issues/317)),
+  so browse doesn't run on a computer with Smart App Control enforced.
 
 ## Development
 

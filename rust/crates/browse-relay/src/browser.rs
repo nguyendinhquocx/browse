@@ -20,6 +20,15 @@ pub enum BrowserRef {
     Direct(Arc<DriverEntry>),
 }
 
+/// A tab idle cleanup may close (`Relay::idle_candidates`).
+#[derive(Debug, Clone)]
+pub struct IdleCandidate {
+    pub tab: i64,
+    pub owner: Owner,
+    pub link_key: String,
+    pub idle: Duration,
+}
+
 /// How long a call waits for a browser that is reconnecting (a worker or relay restart) before failing.
 const RECONNECT_WAIT: Duration = Duration::from_secs(12);
 /// How long a just-started relay waits for the paired browser to dial back after a restart. A suspended service worker
@@ -150,11 +159,11 @@ impl Relay {
             None => None,
         };
         let group = options.group.as_deref().and_then(crate::registry::clean_group);
-        Ok(TabOptions { group, allowed_origins, read_only: options.read_only, keep_visible: options.keep_visible, keep_open: options.keep_open, browser: options.browser.clone() })
+        Ok(TabOptions { group, allowed_origins, read_only: options.read_only, keep_visible: options.keep_visible, keep_open: options.keep_open, browser: options.browser.clone(), new_window: options.new_window, window_of: options.window_of.clone() })
     }
 
     /// Turns the idle-close exemption on or off for a tab, and tells the extension, which runs its own idle cleanup.
-    /// Returns whether the option changed.
+    /// An extension that can't hold a tab yet gets a warning on the tab instead. Returns whether the option changed.
     pub fn set_keep_open(self: &Arc<Self>, tab: i64, keep_open: bool) -> bool {
         let changed = {
             let mut st = self.st();
@@ -167,7 +176,14 @@ impl Relay {
             }
         };
         if changed {
-            self.ext_best_effort(tab, "tabs.keepOpen", json!({ "keepOpen": keep_open }));
+            let link = self.st().browser_tab(tab).map(|(link, _)| link);
+            match link {
+                Some(link) if link.keeps_open() => {
+                    self.ext_best_effort(tab, "tabs.keepOpen", json!({ "keepOpen": keep_open }));
+                }
+                Some(link) if keep_open => self.warn_keep_open_unavailable(tab, &link),
+                _ => {}
+            }
             self.schedule_persist();
         }
         changed
@@ -227,6 +243,16 @@ impl Relay {
             return Ok(BrowserRef::Extension(link.clone()));
         }
         direct(&st).map(BrowserRef::Direct).ok_or_else(|| anyhow!("No browser is connected. Open the browser with the browse extension."))
+    }
+
+    /// Says a keepOpen tab still closes when idle: the connected extension runs its own idle cleanup and can't hold
+    /// one back.
+    pub fn warn_keep_open_unavailable(&self, tab: i64, link: &Link) {
+        let version = link.version.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
+        let warning = format!("The connected browse extension{version} can't keep tabs open yet, so this tab still closes when idle. Update the extension to 0.1.2 or newer to keep it open.");
+        if let Some(entry) = self.st().tabs.get_mut(&tab) {
+            entry.add_warning(warning);
+        }
     }
 
     /// The browser to open a tab in: the one named (waiting briefly while it reconnects), else the first connected.
@@ -324,11 +350,16 @@ impl Relay {
     /// Tabs idle cleanup may close: no call used them for `ttl`. A call, a handoff, a capture or a recording on a tab
     /// keeps it open, and so does `keepOpen`.
     pub fn idle_tabs(&self, ttl: Duration) -> Vec<(i64, Owner)> {
+        self.idle_candidates().into_iter().filter(|c| c.idle >= ttl).map(|c| (c.tab, c.owner)).collect()
+    }
+
+    /// Every tab idle cleanup may close, with how long no call used it and its browser's link.
+    pub fn idle_candidates(&self) -> Vec<IdleCandidate> {
         let st = self.st();
         st.tabs
             .values()
-            .filter(|t| !t.options.keep_open && !t.closing && !t.focused && t.last_used.elapsed() >= ttl && st.handoff_for_tab(t.id).is_none() && !st.tab_busy(t.id))
-            .map(|t| (t.id, t.owner))
+            .filter(|t| !t.options.keep_open && !t.closing && !t.focused && st.handoff_for_tab(t.id).is_none() && !st.tab_busy(t.id))
+            .map(|t| IdleCandidate { tab: t.id, owner: t.owner, link_key: t.link_key.clone(), idle: t.last_used.elapsed() })
             .collect()
     }
 
@@ -497,7 +528,7 @@ impl TabPolicy for RelayTabPolicy {
 pub struct RelayBrowser(pub Arc<Relay>);
 
 impl RelayBrowser {
-    /// Raw CDP handle for a tab (used by relay-internal CDP guardrail tests and `tab_driver`).
+    /// Raw CDP handle for a tab (used by relay-internal CDP guardrail tests, `tab_driver` and `bring_to_front`).
     pub async fn cdp(&self, tab: TabId) -> anyhow::Result<Arc<dyn Cdp>> {
         self.0.await_tab(tab).await;
         self.0.usable_tab(tab)?;
@@ -527,6 +558,13 @@ impl Browser for RelayBrowser {
 
     async fn tabs(&self) -> anyhow::Result<Vec<TabInfo>> {
         Ok(self.0.tab_infos())
+    }
+
+    /// Through the tab's guarded CDP connection: Page.bringToFront is refused for a read-only tab and
+    /// unless OPENCODE_BROWSER_ALLOW_FOREGROUND=1 (guardrails.rs), so nothing reaches Chrome otherwise.
+    async fn bring_to_front(&self, tab: TabId) -> anyhow::Result<()> {
+        let cdp = self.cdp(tab).await?;
+        cdp.send("Page.bringToFront", json!({}), None).await.map(|_| ()).map_err(|error| anyhow!("{error}"))
     }
 
     async fn close_tab(&self, tab: TabId) -> anyhow::Result<()> {

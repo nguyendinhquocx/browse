@@ -7,10 +7,19 @@ use async_trait::async_trait;
 use browse_core::{Browser, Content, HandoffResult, TabDriver, TabId, TabInfo, TabOptions, TabState, Tool, ToolContext, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
+/// The tabs the fake was asked to bring to the front, and the refusal it should answer with.
+#[derive(Default)]
+struct Front {
+    tabs: std::sync::Mutex<Vec<TabId>>,
+    refusal: std::sync::Mutex<Option<String>>,
+}
+
 /// Tab 7 shows example.com; every tab id has its own state.
 #[derive(Default)]
 struct FakeBrowser {
     states: std::sync::Mutex<std::collections::HashMap<TabId, Arc<TabState>>>,
+    /// Some for a test that needs the front; the plain context refuses it as before.
+    front: Option<Arc<Front>>,
 }
 
 #[async_trait]
@@ -27,6 +36,14 @@ impl Browser for FakeBrowser {
     async fn tab_driver(&self, _: TabId) -> anyhow::Result<Arc<dyn TabDriver>> {
         anyhow::bail!("no driver here")
     }
+    async fn bring_to_front(&self, tab: TabId) -> anyhow::Result<()> {
+        let Some(front) = &self.front else { anyhow::bail!("no front here") };
+        front.tabs.lock().unwrap().push(tab);
+        match front.refusal.lock().unwrap().clone() {
+            Some(refusal) => anyhow::bail!(refusal),
+            None => Ok(()),
+        }
+    }
     async fn state(&self, tab: TabId) -> anyhow::Result<Arc<TabState>> {
         Ok(self.states.lock().unwrap().entry(tab).or_default().clone())
     }
@@ -38,7 +55,8 @@ impl Browser for FakeBrowser {
     }
 }
 
-/// `echo` returns its arguments, `fail` fails with `message`, `picture` returns an image, `handoff` waits `ms`.
+/// `echo` returns its arguments, `fail` fails with `message`, `picture` returns an image, `handoff` waits `ms`, `cut`
+/// returns a result cut to fit like an oversized eval's.
 struct Fake(&'static str);
 
 #[async_trait]
@@ -55,6 +73,7 @@ impl Tool for Fake {
             "navigate" => ToolOutput::text(json!({ "tab": args.get("tab").cloned().unwrap_or(json!(7)), "url": args["url"], "title": "T", "status": 200, "navigated": true }).to_string()),
             // Echo the upload args so a test can see what setInputFiles hands the tool.
             "upload" => ToolOutput::text(args.to_string()),
+            "cut" => ToolOutput { structured_content: Some(json!({ "value": null, "truncated": "the result is 300002 characters" })), ..ToolOutput::text("\"xxxx\n… [truncated: the result is 300002 characters]") },
             "handoff" => {
                 tokio::time::sleep(Duration::from_millis(args["ms"].as_u64().unwrap_or(0))).await;
                 ToolOutput::text(json!({ "outcome": "continued" }).to_string())
@@ -68,8 +87,14 @@ fn context() -> ToolContext {
     ToolContext { browser: Arc::new(FakeBrowser::default()), file_roots: vec![] }
 }
 
+fn front_context() -> (ToolContext, Arc<Front>) {
+    let front = Arc::new(Front::default());
+    let browser = FakeBrowser { front: Some(front.clone()), ..Default::default() };
+    (ToolContext { browser: Arc::new(browser), file_roots: vec![] }, front)
+}
+
 fn execute() -> Arc<dyn Tool> {
-    let fakes: Vec<Arc<dyn Tool>> = ["echo", "fail", "picture", "navigate", "handoff", "upload"].into_iter().map(|n| Arc::new(Fake(n)) as Arc<dyn Tool>).collect();
+    let fakes: Vec<Arc<dyn Tool>> = ["echo", "fail", "picture", "navigate", "handoff", "upload", "cut"].into_iter().map(|n| Arc::new(Fake(n)) as Arc<dyn Tool>).collect();
     crate::tools(&fakes).remove(0)
 }
 
@@ -122,6 +147,9 @@ async fn tools_and_errors() {
     assert_eq!(ok("page.url()").await, "about:blank", "a page without a tab is blank");
     let fetched = err("await fetch('https://example.com')").await;
     assert!(fetched.contains("page.evaluate"), "{fetched}");
+    // A result cut to fit (eval over its cap) fails the call instead of handing the script the cut JSON text.
+    let cut = err("const r = await browse.cut({}); return r.length").await;
+    assert!(cut.contains("cut: the result is 300002 characters") && cut.contains("call once per part"), "{cut}");
 }
 
 #[tokio::test]
@@ -237,6 +265,33 @@ async fn timers_state_and_limits() {
     assert!(memory.contains("out of memory"), "{memory}");
     let deep = err("const f = (n) => f(n + 1); f(0)").await;
     assert!(deep.contains("stack") || deep.contains("RangeError") || deep.contains("InternalError"), "{deep}");
+}
+
+#[tokio::test]
+async fn bring_to_front_calls_the_browser_and_reports_refusal_as_a_warning() {
+    let (ctx, front) = front_context();
+    let (text, output) = run_in(&ctx, json!({ "code": "await page.bringToFront(); return 'raised'", "tab": 7 })).await;
+    assert!(!output.is_error, "{text}");
+    assert!(text.contains("raised"), "{text}");
+    assert_eq!(*front.tabs.lock().unwrap(), vec![7], "the page's tab is used");
+
+    *front.refusal.lock().unwrap() = Some(
+        "browse blocked Page.bringToFront: it raises the user's browser window over their work; set OPENCODE_BROWSER_ALLOW_FOREGROUND=1 on the relay to allow it.".into(),
+    );
+    let (text, output) = run_in(&ctx, json!({ "code": "await page.bringToFront(); return 'completed'", "tab": 7 })).await;
+    assert!(!output.is_error, "a refusal is a warning, not a script error: {text}");
+    assert!(text.contains("completed"), "{text}");
+    assert!(
+        text.contains("Warnings:") && text.contains("page.bringToFront(): browse blocked Page.bringToFront") && text.contains("OPENCODE_BROWSER_ALLOW_FOREGROUND=1"),
+        "{text}"
+    );
+    assert_eq!(front.tabs.lock().unwrap().len(), 2, "the refused call was still attempted");
+
+    let (ctx, front) = front_context();
+    let (text, output) = run_in(&ctx, json!({ "code": "await page.bringToFront(); return 'no tab'", "tab": null })).await;
+    assert!(!output.is_error, "{text}");
+    assert!(text.contains("no tab") && !text.contains("Warnings:"), "{text}");
+    assert!(front.tabs.lock().unwrap().is_empty(), "a page with no tab asks for nothing");
 }
 
 #[tokio::test]

@@ -570,6 +570,9 @@ pub struct Relay {
     pub origins: HashSet<String>,
     pub file_roots: Vec<PathBuf>,
     pub auto_update: Option<AutoUpdateStatus>,
+    /// Idle cleanup for directly driven tabs, or an extension too old to report its setting
+    /// (OPENCODE_BROWSER_IDLE_TAB_TTL_MS, the idle close setting's 10 minute default when unset; None: never).
+    /// Extension tabs follow their browser's idleMinutes setting instead (`serve::reap_idle`).
     pub idle_tab_ttl: Option<Duration>,
     pub state: Mutex<State>,
     pub changed: Notify,
@@ -591,6 +594,8 @@ pub struct Relay {
     pub finished: AtomicBool,
     /// Where to look for Firefox-family apps for `nextStep`; None looks nowhere (tests).
     pub firefox: Option<crate::firefox::Discovery>,
+    /// The Chrome-family browsers here with browse enabled, to name a browser that only says it is Chrome.
+    pub installed: Option<InstalledBrowsers>,
     /// When the relay last tried to attach the recorded Firefox profiles.
     pub(crate) auto_attached: Mutex<Option<Instant>>,
     /// Driver keys of recorded profiles whose WebDriver BiDi session another client holds.
@@ -607,7 +612,17 @@ pub struct RelayConfig {
     pub auto_update: Option<AutoUpdateStatus>,
     /// Where to look for Firefox-family apps (`crate::firefox::Discovery::system()`); None looks nowhere.
     pub firefox: Option<crate::firefox::Discovery>,
+    /// The Chrome-family browsers here with browse enabled; None looks nowhere.
+    pub installed: Option<InstalledBrowsers>,
 }
+
+/// Names of the Chrome-family browsers on this computer with a profile that has browse enabled ("Google Chrome",
+/// "Helium"), from the `browse` binary's browser list.
+pub type InstalledBrowsers = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// The idle close setting's 10 minute default (src/shared/protocol.ts DEFAULT_IDLE_MINUTES): the idle time for tabs
+/// no browser setting covers.
+const DEFAULT_IDLE_TTL_MS: u64 = 10 * 60_000;
 
 fn env_ms(variable: &str, fallback: u64) -> Option<Duration> {
     let value = std::env::var(variable).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(fallback);
@@ -638,7 +653,7 @@ impl Relay {
             origins: crate::origins::allowed_extension_origins(),
             file_roots,
             auto_update: config.auto_update,
-            idle_tab_ttl: env_ms("OPENCODE_BROWSER_IDLE_TAB_TTL_MS", 15 * 60_000),
+            idle_tab_ttl: env_ms("OPENCODE_BROWSER_IDLE_TAB_TTL_MS", DEFAULT_IDLE_TTL_MS),
             state: Mutex::new(State {
                 links: Vec::new(),
                 drivers: Vec::new(),
@@ -681,6 +696,7 @@ impl Relay {
             heartbeat: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             firefox: config.firefox,
+            installed: config.installed,
             auto_attached: Mutex::new(None),
             firefox_busy: Mutex::new(Vec::new()),
         }))
@@ -781,6 +797,14 @@ impl Relay {
         };
         match &result {
             Err(RpcError::Remote(message)) if missing_tab(message) => self.me().forget_missing_tab(tab, method),
+            Err(RpcError::Remote(message)) if message.starts_with(NAVIGATE_DETACHED) => {
+                let url = message[NAVIGATE_DETACHED.len()..].to_string();
+                if !url.is_empty()
+                    && let Some(entry) = self.st().tabs.get_mut(&tab) {
+                        entry.url = url.clone();
+                    }
+                return Err(RpcError::Remote(navigate_detached_message(&url)));
+            }
             Err(RpcError::Remote(message))
                 if protected_ui_error(message) || (message.contains("not attached") && self.st().tabs.get(&tab).is_some_and(|t| t.protected_ui)) =>
             {
@@ -932,6 +956,17 @@ pub fn unattachable_message(tab: i64, url: &str) -> String {
     let page = if url.is_empty() { String::new() } else { format!(" ({})", crate::util::short_url(url)) };
     format!(
         "Tab {tab} is stuck on a Chrome error page{page}: its last load failed (blocked by the browser or another extension), and Chrome doesn't let browse into that page. Close it with the tabs tool and open another with navigate (without tab). A tab the user lent has to be navigated by the user."
+    )
+}
+
+/// The extension's answer when Chrome dropped the debugger mid Page.navigate but the tab is still there, followed by the
+/// tab's url (NAVIGATE_DETACHED in the extension's wire.ts).
+pub const NAVIGATE_DETACHED: &str = "Navigation detached the debugger; the tab is at ";
+
+pub fn navigate_detached_message(url: &str) -> String {
+    let page = if url.is_empty() { String::new() } else { format!(", leaving it at {}", crate::util::short_url(url)) };
+    format!(
+        "Chrome detached browse from the tab while it navigated{page}: another extension or Chrome itself probably blocked the page (an extension's block page or a Chrome error page). Try another URL, or ask the user what blocks this one."
     )
 }
 

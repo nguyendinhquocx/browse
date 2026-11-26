@@ -197,7 +197,7 @@ impl TabDriver for FakeTab {
     }
 }
 
-struct FakeBrowser {
+pub(super) struct FakeBrowser {
     info: DriverInfo,
     events: broadcast::Sender<BrowserEvent>,
     tabs: Mutex<HashMap<String, Arc<FakeTab>>>,
@@ -209,7 +209,7 @@ struct FakeBrowser {
 }
 
 impl FakeBrowser {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             info: DriverInfo { id: "bidi+ws".into(), name: "WebDriver BiDi".into(), protocol: "webdriver-bidi".into(), transport: "ws".into(), browser: "firefox 159.0".into() },
             events: broadcast::channel(256).0,
@@ -282,7 +282,7 @@ impl BrowserDriver for FakeBrowser {
     }
 }
 
-async fn register(relay: &Arc<Relay>, fake: &Arc<FakeBrowser>) -> Arc<crate::relay::DriverEntry> {
+pub(super) async fn register(relay: &Arc<Relay>, fake: &Arc<FakeBrowser>) -> Arc<crate::relay::DriverEntry> {
     let driver: Arc<dyn BrowserDriver> = fake.clone();
     relay.register_driver(driver, "driver:fake:1".into(), "Firefox".into(), Some("159.0".into()), Some("ws://127.0.0.1:1/session".into()), true).await.unwrap()
 }
@@ -324,6 +324,28 @@ async fn a_direct_tab_opens_navigates_and_closes() {
     assert_eq!(fake.closed(), vec![target]);
     assert!(!relay.st().tabs.contains_key(&info.tab));
     assert_eq!(relay.st().gone_tab(info.tab).unwrap().why, "it was closed with the tabs tool");
+}
+
+/// Window placement is the extension's: a directly driven browser refuses newWindow and windowOf before opening
+/// anything, and a direct tab never keeps them, so its popups don't inherit them.
+#[tokio::test]
+async fn a_direct_browser_refuses_window_placement_and_never_keeps_it() {
+    let h = harness().await;
+    let relay = h.handle.relay.clone();
+    let fake = FakeBrowser::new();
+    let entry = register(&relay, &fake).await;
+    let browser = h.handle.browser();
+    let refused = browser.open_tab(None, &TabOptions { new_window: true, ..TabOptions::default() }).await.err().unwrap().to_string();
+    assert!(refused.contains("directly driven"), "{refused}");
+    assert!(fake.opened().is_empty());
+    let first = browser.open_tab(None, &TabOptions::default()).await.unwrap().tab;
+    let beside = TabOptions { window_of: Some(first.to_string()), ..TabOptions::default() };
+    let refused = browser.open_tab(None, &beside).await.err().unwrap().to_string();
+    assert!(refused.contains("directly driven"), "{refused}");
+    assert_eq!(fake.opened().len(), 1);
+    let kept = relay.create_tab_direct(entry, None, &TabOptions { new_window: true, window_of: Some("x".into()), ..TabOptions::default() }, None, None).await.unwrap();
+    let options = relay.st().tabs[&kept].options.clone();
+    assert!(!options.new_window && options.window_of.is_none(), "{options:?}");
 }
 
 #[tokio::test]
@@ -375,7 +397,7 @@ async fn idle_cleanup_closes_a_direct_tab() {
     register(&relay, &fake).await;
     let info = h.handle.browser().open_tab(None, &TabOptions::default()).await.unwrap();
     relay.st().tabs.get_mut(&info.tab).unwrap().last_used = std::time::Instant::now() - Duration::from_secs(3_600);
-    crate::serve::reap_idle(&relay, Duration::from_secs(60)).await;
+    crate::serve::reap_idle(&relay, Some(Duration::from_secs(60))).await;
     assert_eq!(fake.closed(), fake.opened());
     assert!(!relay.st().tabs.contains_key(&info.tab));
     assert_eq!(relay.st().gone_tab(info.tab).unwrap().why, "it was idle, so browse closed it");
